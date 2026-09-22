@@ -53,7 +53,9 @@ async function checked<T>(operation: Promise<unknown>, parser: (value: unknown) 
   } catch (error) {
     const normalized = normalizeSdkError(error);
     if (normalized.name === "ZodError") {
-      throw new Error(`Gopeed SDK 返回数据不符合约定：${contractErrorMessage(error)}`);
+      throw Object.assign(new Error(`Gopeed SDK 返回数据不符合约定：${contractErrorMessage(error)}`), {
+        name: "GopeedContractError"
+      });
     }
     throw normalized;
   }

@@ -36,7 +36,9 @@
     "test:release-candidate:preflight": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-release-candidate-install.ps1",
     "test:release-candidate:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-release-candidate-install.ps1 -RunAcceptance",
     "release:check-version": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/assert-release-version.ps1",
-    "release:notes": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/get-release-notes.ps1"
+    "release:notes": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/get-release-notes.ps1",
+    "design": "node scripts/design-preview.mjs",
+    "build:design": "node scripts/design-preview.mjs --build"
   },
   "dependencies": {
     "@gopeed/rest": "1.7.0",

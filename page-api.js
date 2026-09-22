@@ -80,6 +80,25 @@
     observer.observe({ type: "resource", buffered: true });
   } catch {}
 
+  /**
+   * 从 Cookie 或 Web Storage 中解析当前登录用户的访问令牌。
+   * POPO 页面在调用取址与鉴权接口时，要求在 Request Headers 中显式携带 Authorization 与 Devicetype，
+   * 否则网关会将请求判定为未授权访客并返回 status: 405 (没有权限操作)。
+   */
+  function resolveAuthToken() {
+    try {
+      const match = document.cookie.match(/(?:^|;\s*)accessToken=([^;]+)/);
+      if (match && match[1]) return decodeURIComponent(match[1]);
+    } catch {}
+    try {
+      return window.localStorage.getItem("accessToken") ||
+             window.sessionStorage.getItem("accessToken") ||
+             "";
+    } catch {
+      return "";
+    }
+  }
+
   window.addEventListener("message", async (event) => {
     if (event.source !== window || event.data?.source !== REQUEST_SOURCE) return;
     const { requestId, path } = event.data;
@@ -93,9 +112,17 @@
     if (requestUrl.origin !== window.location.origin || !ALLOWED_PATHS.has(requestUrl.pathname)) return;
 
     try {
+      const headers = {
+        Accept: "application/json, text/plain, */*",
+        Devicetype: "7"
+      };
+      const authToken = resolveAuthToken();
+      if (authToken) {
+        headers.Authorization = authToken;
+      }
       const response = await window.fetch(`${requestUrl.pathname}${requestUrl.search}`, {
         credentials: "include",
-        headers: { Accept: "application/json" },
+        headers,
         method: "GET"
       });
       reportObservedUrl(response.url);

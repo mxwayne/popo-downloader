@@ -8,7 +8,7 @@
 2. 可以连续点击 2–3 个母文件夹右侧的蓝色下载按钮。
 3. 扩展按点击顺序排队，只读取被选择的文件夹及其子文件夹。
 4. 每个文件夹页会在“按照目录顺序”左侧显示当前目录第一层的项目总数（文件 + 文件夹）。
-5. 点击下载后直接加入队列，不再弹出数量确认；递归扫描完成后以固定任务并发数 5 把单文件地址交给 Gopeed。
+5. 点击下载后直接加入队列，不再弹出数量确认；递归扫描完成后以默认任务并发数 5 把单文件地址交给 Gopeed；全部任务结束后，可在设置中调整为 1–5。
 
 POPO 原来的“三个点 → 下载”保持不变，仍然可以用于服务器打包 ZIP。
 
@@ -91,6 +91,10 @@ npm run build:runtime
 ```
 
 普通 Extension JavaScript、CSS 或 HTML 修改后运行 `npm run dev:extension:sync`，再打开 `chrome://extensions/`，找到“POPO Dev 下载助手”并点击重新加载，然后刷新 POPO 页面。该命令固定同步到 `D:\POPO\Dev\POPODevDownloader\Extension`，不会修改 Stable 安装目录。只有 Native Host、Agent、安装器或注册配置发生变化时才重新构建 Dev 包。
+
+## Design 页面
+
+运行 `npm run design`，打开 `http://127.0.0.1:4178/design.html`。页面包含基础规范、共享组件、动效和多文件夹下载交互样板，全部使用隔离模拟数据。源码组织与验收说明见 [`docs/DESIGN.md`](docs/DESIGN.md)。
 
 ## 验证命令
 

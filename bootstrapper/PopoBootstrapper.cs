@@ -52,7 +52,8 @@ internal static class PopoBootstrapper
             ExtractPayload(zipPath, tempRoot);
 
             ValidateExtractedPayload(tempRoot);
-            exitCode = RunSetup(Path.Combine(tempRoot, "POPO-Setup.exe"), args);
+            string setupExecutable = ResolveSetupExecutable(tempRoot);
+            exitCode = RunSetup(setupExecutable, args);
         }
         catch (BootstrapperException error)
         {
@@ -61,7 +62,7 @@ internal static class PopoBootstrapper
             {
                 MessageBox.Show(
                     error.Message,
-                    "POPO 稳定下载助手",
+                    GetProductTitle(),
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error
                 );
@@ -74,7 +75,7 @@ internal static class PopoBootstrapper
             {
                 MessageBox.Show(
                     "POPO 安装包准备失败。\r\n\r\n" + error.Message,
-                    "POPO 稳定下载助手",
+                    GetProductTitle(),
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error
                 );
@@ -193,11 +194,37 @@ internal static class PopoBootstrapper
         }
     }
 
+    private static string GetProductTitle()
+    {
+        return PayloadRootName.IndexOf("dev", StringComparison.OrdinalIgnoreCase) >= 0
+            ? "POPO Dev 下载助手"
+            : "POPO 稳定下载助手";
+    }
+
+    private static string ResolveSetupExecutable(string packageRoot)
+    {
+        string[] candidates = {
+            "popo-dev-setup.exe",
+            "popo-setup.exe",
+            "POPO-Dev-Setup.exe",
+            "POPO-Setup.exe"
+        };
+        foreach (string name in candidates)
+        {
+            string candidatePath = Path.Combine(packageRoot, name);
+            if (File.Exists(candidatePath))
+            {
+                return candidatePath;
+            }
+        }
+        throw new BootstrapperException(13, "POPO 安装 payload 缺失 setup 执行文件。");
+    }
+
     private static void ValidateExtractedPayload(string packageRoot)
     {
+        ResolveSetupExecutable(packageRoot);
         string[] requiredFiles =
         {
-            "POPO-Setup.exe",
             "release-manifest.json",
             Path.Combine("extension", "manifest.json"),
             Path.Combine("Gopeed", "gopeed.exe"),

@@ -38,16 +38,16 @@ $distRoot = if ($OutputDirectory) {
   Join-Path $repoRoot 'dist'
 }
 $packageName = if ($isDev) {
-  "POPO-Dev-Downloader-$versionName-win-x64"
+  "popo-dev-downloader-$versionName-win-x64"
 } else {
-  "POPO-Stable-Downloader-$versionName-win-x64"
+  "popo-stable-downloader-$versionName-win-x64"
 }
 $stagingRoot = Join-Path $distRoot $packageName
 $zipPath = Join-Path $distRoot "$packageName.zip"
 $checksumPath = "$zipPath.sha256.txt"
 $channelManifestPath = if ($isDev) { '' } else { Join-Path $distRoot 'latest.json' }
-$bootstrapperPath = if ($isDev) { '' } else { Join-Path $distRoot "$packageName.exe" }
-$bootstrapperChecksumPath = if ($isDev) { '' } else { "$bootstrapperPath.sha256.txt" }
+$bootstrapperPath = Join-Path $distRoot "$packageName.exe"
+$bootstrapperChecksumPath = "$bootstrapperPath.sha256.txt"
 $updateBaseUrl = 'https://popo-updates-1461466196.cos.ap-guangzhou.myqcloud.com/stable'
 $signingKeyPath = Join-Path $env:LOCALAPPDATA 'POPORelease\release-signing-key.dpapi'
 $gopeedVendorRoot = Join-Path $repoRoot 'vendor\gopeed\v1.9.3'
@@ -57,7 +57,7 @@ $compiler = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 $nativeSource = Join-Path $repoRoot 'native-host\FolderPickerHost.cs'
 $agentSource = Join-Path $repoRoot 'agent\PopoAgent.cs'
 $setupSource = Join-Path $repoRoot 'setup\PopoSetup.cs'
-$setupExecutableName = if ($isDev) { 'POPO-Dev-Setup.exe' } else { 'POPO-Setup.exe' }
+$setupExecutableName = if ($isDev) { 'popo-dev-setup.exe' } else { 'popo-setup.exe' }
 $buildDefinition = if ($isDev) { '/define:POPO_DEV_BUILD' } else { $null }
 $compileRoot = Join-Path ([System.IO.Path]::GetTempPath()) `
   ("popo-package-compile-" + [Guid]::NewGuid().ToString('N'))
@@ -170,10 +170,8 @@ New-Item -ItemType Directory -Path $gopeedLicenseRoot -Force | Out-Null
 Copy-PopoExtensionSource -RepoRoot $repoRoot -DestinationRoot $extensionRoot -Channel $Channel | Out-Null
 
 Copy-Item -LiteralPath (Join-Path $repoRoot 'native-host\FolderPickerHost.cs') -Destination $nativeHostRoot
-if (-not $isDev) {
-  Copy-Item -LiteralPath (Join-Path $repoRoot 'native-host\install.ps1') -Destination $nativeHostRoot
-  Copy-Item -LiteralPath (Join-Path $repoRoot 'native-host\uninstall.ps1') -Destination $nativeHostRoot
-}
+Copy-Item -LiteralPath (Join-Path $repoRoot 'native-host\install.ps1') -Destination $nativeHostRoot
+Copy-Item -LiteralPath (Join-Path $repoRoot 'native-host\uninstall.ps1') -Destination $nativeHostRoot
 Copy-Item -LiteralPath $nativeExecutable -Destination (Join-Path $nativeHostRoot 'bin')
 [System.IO.File]::WriteAllText(
   (Join-Path $nativeHostRoot 'bin\.popo-native-version'),
@@ -188,6 +186,12 @@ Copy-Item -LiteralPath $agentExecutable -Destination (Join-Path $agentRoot 'bin'
   (New-Object System.Text.UTF8Encoding($false))
 )
 Copy-Item -LiteralPath $setupExecutable -Destination (Join-Path $stagingRoot $setupExecutableName)
+if (Test-Path -LiteralPath (Join-Path $repoRoot 'install.cmd')) {
+  Copy-Item -LiteralPath (Join-Path $repoRoot 'install.cmd') -Destination $stagingRoot
+}
+if (Test-Path -LiteralPath (Join-Path $repoRoot 'uninstall.cmd')) {
+  Copy-Item -LiteralPath (Join-Path $repoRoot 'uninstall.cmd') -Destination $stagingRoot
+}
 Copy-Item -LiteralPath (Join-Path $repoRoot $(if ($isDev) { 'DEV-TESTING.md' } else { 'TESTING.md' })) -Destination $stagingRoot
 Copy-Item -LiteralPath (Join-Path $repoRoot 'THIRD-PARTY-NOTICES.md') -Destination $stagingRoot
 
@@ -305,7 +309,9 @@ if (-not $isDev) {
     $channelJson,
     (New-Object System.Text.UTF8Encoding($false))
   )
+}
 
+if ($bootstrapperPath) {
   $bootstrapperBuildScript = Join-Path $PSScriptRoot 'build-bootstrapper.ps1'
   if (-not (Test-Path -LiteralPath $bootstrapperBuildScript)) {
     throw "Bootstrapper build script was not found: $bootstrapperBuildScript"

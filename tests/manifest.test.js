@@ -67,7 +67,7 @@ test("扩展运行时不包含 Playwright", () => {
 
 test("React 页面根接管项目数、文件夹按钮、任务条和通知", () => {
   const content = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
-  const pageUi = fs.readFileSync(path.join(__dirname, "..", "src", "page-ui.tsx"), "utf8");
+  const pageUi = ["page-ui.tsx", "ui/page-components.tsx", "ui/page-styles.ts"].map(file => fs.readFileSync(path.join(__dirname, "..", "src", file), "utf8")).join("\n");
   assert.match(pageUi, /function PageEnhancerApp/);
   assert.match(pageUi, /createPortal/);
   assert.match(pageUi, /ProjectCount/);
@@ -115,7 +115,7 @@ test("React 页面根接管项目数、文件夹按钮、任务条和通知", ()
 });
 
 test("页面只创建一个 React 根且 Portal 监听不会形成 DOM 死循环", () => {
-  const pageUi = fs.readFileSync(path.join(__dirname, "..", "src", "page-ui.tsx"), "utf8");
+  const pageUi = ["page-ui.tsx", "ui/page-components.tsx", "ui/page-styles.ts"].map(file => fs.readFileSync(path.join(__dirname, "..", "src", file), "utf8")).join("\n");
   assert.equal((pageUi.match(/createRoot\(/g) || []).length, 1);
   assert.match(pageUi, /createPortal/);
   assert.match(pageUi, /function mutationNeedsReconcile/);
@@ -132,7 +132,7 @@ test("页面只创建一个 React 根且 Portal 监听不会形成 DOM 死循环
 
 test("弹窗只展示普通用户需要的任务和保存位置", () => {
   const popup = fs.readFileSync(path.join(__dirname, "..", "popup.html"), "utf8");
-  const popupScript = fs.readFileSync(path.join(__dirname, "..", "src", "popup.tsx"), "utf8");
+  const popupScript = ["popup.tsx", "ui/popup-components.tsx"].map(file => fs.readFileSync(path.join(__dirname, "..", "src", file), "utf8")).join("\n");
   assert.doesNotMatch(popup, /扫描当前文件夹|文件格式|包含关键词|导出 CSV|导出 JSON|清空任务/);
   assert.match(popup, /id="popup-root"/);
   assert.match(popup, /runtime\/popup\.js/);
@@ -163,9 +163,9 @@ test("弹窗只展示普通用户需要的任务和保存位置", () => {
 
 test("POPO Logo 保留在弹窗和扩展图标中并支持明暗主题", () => {
   const popup = fs.readFileSync(path.join(__dirname, "..", "popup.html"), "utf8");
-  const popupSource = fs.readFileSync(path.join(__dirname, "..", "src", "popup.tsx"), "utf8");
+  const popupSource = ["popup.tsx", "ui/popup-components.tsx"].map(file => fs.readFileSync(path.join(__dirname, "..", "src", file), "utf8")).join("\n");
   const popupCss = fs.readFileSync(path.join(__dirname, "..", "popup.css"), "utf8");
-  const pageUi = fs.readFileSync(path.join(__dirname, "..", "src", "page-ui.tsx"), "utf8");
+  const pageUi = ["page-ui.tsx", "ui/page-components.tsx", "ui/page-styles.ts"].map(file => fs.readFileSync(path.join(__dirname, "..", "src", file), "utf8")).join("\n");
   const logo = fs.readFileSync(path.join(__dirname, "..", "assets", "popo-logo.svg"), "utf8");
 
   assert.match(popup, /runtime\/popup\.js/);
@@ -206,7 +206,7 @@ test("网页行内按钮使用 Lucide 图标和无刻度粗进度条", () => {
   const packageJson = JSON.parse(
     fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8")
   );
-  const pageUi = fs.readFileSync(path.join(__dirname, "..", "src", "page-ui.tsx"), "utf8");
+  const pageUi = ["page-ui.tsx", "ui/page-components.tsx", "ui/page-styles.ts"].map(file => fs.readFileSync(path.join(__dirname, "..", "src", file), "utf8")).join("\n");
 
   assert.equal(packageJson.dependencies["lucide-react"], "1.29.0");
   assert.match(pageUi, /popo-download-idle-icon/);
@@ -224,7 +224,7 @@ test("网页行内按钮使用 Lucide 图标和无刻度粗进度条", () => {
 });
 
 test("网页、任务摘要、通知和弹窗共享克制的深色渐变状态系统", () => {
-  const pageUi = fs.readFileSync(path.join(__dirname, "..", "src", "page-ui.tsx"), "utf8");
+  const pageUi = ["page-ui.tsx", "ui/page-components.tsx", "ui/page-styles.ts"].map(file => fs.readFileSync(path.join(__dirname, "..", "src", file), "utf8")).join("\n");
   const popupCss = fs.readFileSync(path.join(__dirname, "..", "popup.css"), "utf8");
 
   assert.match(pageUi, /--popo-gradient-surface/);
@@ -255,7 +255,7 @@ test("网页、任务摘要、通知和弹窗共享克制的深色渐变状态�
 test("下载由 Gopeed 统一管理且并行上限可在 1 到 5 之间调节", () => {
   const background = fs.readFileSync(path.join(__dirname, "..", "background.js"), "utf8");
   const content = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
-  const popup = fs.readFileSync(path.join(__dirname, "..", "src", "popup.tsx"), "utf8");
+  const popup = ["popup.tsx", "ui/popup-components.tsx"].map(file => fs.readFileSync(path.join(__dirname, "..", "src", file), "utf8")).join("\n");
   assert.match(background, /concurrency:\s*5/);
   assert.match(background, /MAX_DOWNLOAD_CONCURRENCY\s*=\s*5/);
   assert.match(background, /SET_DOWNLOAD_CONCURRENCY/);
@@ -333,7 +333,7 @@ test("下载由 Gopeed 统一管理且并行上限可在 1 到 5 之间调节", 
 });
 
 test("弹窗为每个任务显示文件进度条", () => {
-  const popup = fs.readFileSync(path.join(__dirname, "..", "src", "popup.tsx"), "utf8");
+  const popup = ["popup.tsx", "ui/popup-components.tsx"].map(file => fs.readFileSync(path.join(__dirname, "..", "src", file), "utf8")).join("\n");
   const popupHtml = fs.readFileSync(path.join(__dirname, "..", "popup.html"), "utf8");
   const popupCss = fs.readFileSync(path.join(__dirname, "..", "popup.css"), "utf8");
   assert.match(popup, /jobProgress/);
@@ -348,7 +348,7 @@ test("弹窗为每个任务显示文件进度条", () => {
 });
 
 test("Dev 弹窗只显示最近一次成功同步的可见批次", () => {
-  const popup = fs.readFileSync(path.join(__dirname, "..", "src", "popup.tsx"), "utf8");
+  const popup = ["popup.tsx", "ui/popup-components.tsx"].map(file => fs.readFileSync(path.join(__dirname, "..", "src", file), "utf8")).join("\n");
   const popupCss = fs.readFileSync(path.join(__dirname, "..", "popup.css"), "utf8");
   const devSync = fs.readFileSync(
     path.join(__dirname, "..", "scripts", "PopoDevExtension.psm1"),

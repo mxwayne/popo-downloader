@@ -96,6 +96,8 @@ const popupUiPorts = new Set();
 const SERVICE_WORKER_STARTED_AT = new Date().toISOString();
 const UPDATE_CHECK_PERIOD_MINUTES = 6 * 60;
 const FAILED_UPDATE_RETRY_THROTTLE_MS = 30 * 1000;
+const WORKER_RECOVERY_MAX_ATTEMPTS = 8;
+const WORKER_RECOVERY_MAX_MS = 5 * 60 * 1000;
 const UPDATE_RELOAD_STATE_KEY = "popoUpdateReloadState";
 const UPDATE_HANDOFF_LOG_KEY = "popoUpdateHandoffLog";
 const MAX_RETAINED_UPDATE_HANDOFF_EVENTS = 32;
@@ -125,11 +127,15 @@ let diagnosticFlushLocked = false;
 const DIAGNOSTIC_EVENT_CODES = new Set([
   "BACKGROUND_UNCAUGHT_ERROR",
   "DOWNLOAD_ATTEMPT_FAILED",
+  "DOWNLOAD_PERMISSION_DENIED",
   "DOWNLOAD_STALLED",
+  "GOPEED_DATA_INVALID",
   "GOPEED_CONNECTION_LOST",
   "GOPEED_RESTART_RECOVERY_BLOCKED",
   "GOPEED_RESTART_RECOVERY_PENDING",
   "GOPEED_TASK_MISSING",
+  "WORKER_RECOVERY_PENDING",
+  "WORKER_RECOVERY_EXHAUSTED",
   "INDEXEDDB_READ_FAILED",
   "INDEXEDDB_WRITE_FALLBACK",
   "MANUAL_DIAGNOSTIC_SNAPSHOT"
@@ -624,6 +630,9 @@ function newState() {
     workerFrameId: null,
     workerReadyUrl: "",
     workerDeadline: 0,
+    workerRecoveryStartedAt: 0,
+    workerRecoveryCount: 0,
+    workerRecoveryPending: false,
     rootUrl: "",
     teamSpaceKey: "",
     teamSpaceId: "",
@@ -947,7 +956,7 @@ function queueDiagnosticCandidate(state, code, level, context = {}) {
   const sanitized = typeof runtimeDiagnostics.sanitizeDiagnosticContext === "function"
     ? runtimeDiagnostics.sanitizeDiagnosticContext(context)
     : sanitizeRuntimeContext(context) || {};
-  const fingerprint = `${code}|${String(sanitized.failureStage || "")}`;
+  const fingerprint = `${code}|${String(sanitized.failureStage || "")}|${String(sanitized.jobId || "")}|${String(sanitized.itemId || "")}`;
   const now = new Date().toISOString();
   const pending = Array.isArray(state.pendingDiagnostics) ? state.pendingDiagnostics : [];
   const recent = [...pending].reverse().find((candidate) =>
@@ -2002,6 +2011,7 @@ async function registerWorkerFrame(sender, url) {
   if (!job || state.triggerMode !== "folder_button" || job.sourceTabId !== tabId) return null;
   state.workerFrameId = frameId;
   state.workerReadyUrl = url;
+  state.workerRecoveryPending = false;
   state.workerSourceTabId = tabId;
   state.workerDeadline = 0;
   if (state.mode === "waiting_worker") {
@@ -2195,7 +2205,11 @@ async function sendToWork(state, message, timeoutMs, label) {
         label
       );
     } catch (error) {
-      throw workerUnavailableError(`POPO 页面刷新导致“${label}”暂时中断`, error);
+      const tab = await getTab(state.sourceTabId);
+      if (!tab || /receiving end does not exist|could not establish connection|extension context invalidated|frame.*removed|no frame with id|message port closed/i.test(String(error))) {
+        throw workerUnavailableError(`POPO 页面刷新导致“${label}”暂时中断`, error);
+      }
+      throw error;
     }
     if (!response?.ok) throw new Error(response?.error || `${label}失败`);
     return response.result;
@@ -2313,6 +2327,9 @@ function clearEngineFields(state) {
   state.rootUrl = "";
   state.teamSpaceKey = "";
   state.teamSpaceId = "";
+  state.workerRecoveryStartedAt = 0;
+  state.workerRecoveryCount = 0;
+  state.workerRecoveryPending = false;
   state.startedAt = "";
   state.completedAt = "";
   state.workflow = newPersistentWorkflow();
@@ -2405,10 +2422,60 @@ async function requestWorkerFrameForActiveJob(state) {
   } catch {}
 }
 
-async function waitForWorkerReconnect(state, message) {
+async function waitForWorkerReconnect(state, message, reason = "worker_frame_missing") {
+  const now = Date.now();
+  state.workerRecoveryStartedAt ||= now;
+  const newEpisode = !state.workerRecoveryPending;
+  if (newEpisode) state.workerRecoveryCount = (state.workerRecoveryCount || 0) + 1;
+  state.workerRecoveryPending = true;
+  const count = state.workerRecoveryCount || 1;
+  const elapsed = now - state.workerRecoveryStartedAt;
+  if (newEpisode) {
+    const item = state.items.find((candidate) => candidate.id === state.preparingItemId);
+    pushRuntimeEvent(state, "WORKER_RECOVERY_PENDING", "warn",
+      "POPO 页面工作区暂不可用，等待恢复", "", {
+        jobId: activeJob(state)?.id || "", itemId: item?.id || "",
+        failureStage: state.phase, reason, retryCount: Number(item?.attempts) || 0,
+        recoveryCount: count
+      });
+  }
+  if (count > WORKER_RECOVERY_MAX_ATTEMPTS || elapsed >= WORKER_RECOVERY_MAX_MS) {
+    const wasWaitingForWorker = state.mode === "waiting_worker";
+    const reason = `POPO 页面工作区恢复超过上限（${count} 次，${Math.ceil(elapsed / 1000)} 秒）；未完成文件已保留供重试`;
+    const pending = state.items.filter((item) => item.selected && item.status === "pending");
+    for (const item of pending) {
+      item.status = "failed";
+      item.stage = "页面恢复超限";
+      item.failureStage = FAILURE.DIRECTORY_LOAD_FAILED;
+      item.error = reason;
+      item.completedAt = new Date().toISOString();
+    }
+    if (state.scanQueue.length || state.resolveQueue.length) {
+      state.scanFailures.push({ path: [], stage: FAILURE.DIRECTORY_LOAD_FAILED, error: reason, at: new Date().toISOString() });
+    }
+    state.scanQueue = [];
+    state.resolveQueue = [];
+    state.preparingItemId = null;
+    state.mode = wasWaitingForWorker ? "waiting_worker" : "downloading";
+    state.phase = "worker_recovery_exhausted";
+    state.workerDeadline = 0;
+    pushRuntimeEvent(state, "WORKER_RECOVERY_EXHAUSTED", "error", reason, "", {
+      jobId: activeJob(state)?.id || "", failureStage: FAILURE.DIRECTORY_LOAD_FAILED,
+      recoveryCount: count, recoveryElapsedMs: elapsed, reason: "worker_recovery_limit"
+    });
+    if (wasWaitingForWorker) {
+      await finalizeActiveJob(state, "failed", reason, {
+        type: "FOLDER_TASK_ERROR", message: reason
+      });
+      return;
+    }
+    await saveState(state);
+    schedulePump(100);
+    return;
+  }
   state.workerFrameId = null;
   state.workerReadyUrl = "";
-  state.workerDeadline = Date.now() + state.settings.timeouts.directoryLoad;
+  state.workerDeadline = state.workerRecoveryStartedAt + WORKER_RECOVERY_MAX_MS;
   state.phase = "waiting_worker";
   if (state.lastMessage !== message) pushLog(state, "warn", message);
   await saveState(state);
@@ -2726,7 +2793,8 @@ async function processScanStep(state) {
       if (isWorkerUnavailableError(error)) {
         await waitForWorkerReconnect(
           state,
-          "POPO 页面刷新中；当前目录稍后自动继续，不计为扫描失败"
+          "POPO 页面刷新中；当前目录稍后自动继续，不计为扫描失败",
+          "worker_message_interrupted"
         );
         return;
       }
@@ -2819,7 +2887,8 @@ async function processScanStep(state) {
       if (isWorkerUnavailableError(error)) {
         await waitForWorkerReconnect(
           state,
-          "POPO 页面刷新中；当前子文件夹稍后自动继续，不计为扫描失败"
+          "POPO 页面刷新中；当前子文件夹稍后自动继续，不计为扫描失败",
+          "worker_message_interrupted"
         );
         return;
       }
@@ -2926,7 +2995,7 @@ function markAttemptFailure(state, item, stage, error, retryTaskId = null) {
     item.completedAt = new Date().toISOString();
     item.retryTaskId = null;
     pushLog(state, "error", `${item.name}：${stage}（任务已取消剩余文件，不再重试）`, detail);
-  } else if (item.attempts <= state.settings.maxRetries) {
+  } else if (error?.code !== "POPO_PERMISSION_DENIED" && item.attempts <= state.settings.maxRetries) {
     item.status = "pending";
     item.stage = `等待重试（${item.attempts}/${state.settings.maxRetries + 1}）`;
     pushLog(state, "warn", `${item.name}：${stage}，将重新加载父目录后重试`, detail);
@@ -2944,7 +3013,13 @@ function markAttemptFailure(state, item, stage, error, retryTaskId = null) {
       failureStage: stage,
       attempt: Number(item.attempts) || 0,
       retrying: item.status === "pending",
-      terminal: item.status === "failed"
+      terminal: item.status === "failed",
+      reason: error?.code === "POPO_PERMISSION_DENIED" ? "permission_denied" : "operation_failed",
+      httpStatus: Number(error?.httpStatus) || 0,
+      businessCode: Number(error?.businessCode) || 0,
+      recoveryCount: Number(state.workerRecoveryCount) || 0,
+      jobId: activeJob(state)?.id || "",
+      itemId: item.id
     }
   );
 }
@@ -3347,12 +3422,13 @@ function pageApiErrorDetail(response) {
   const body = response?.body;
   const status = Number(response?.status) || 0;
   const code = body && typeof body === "object" ? body.code ?? body.status : null;
+  const codeField = body && typeof body === "object" && body.code != null ? "code" : "status";
   const message = body && typeof body === "object"
     ? body.msg || body.message || response?.error || ""
     : response?.error || "";
   return [
     status ? `HTTP ${status}` : "",
-    code != null ? `code ${code}` : "",
+    code != null ? `${codeField} ${code}` : "",
     message ? String(message).slice(0, 180) : ""
   ].filter(Boolean).join("，") || "接口未返回可识别数据";
 }
@@ -3387,6 +3463,23 @@ async function requestDirectDownloadUrl(state, pageId) {
       pageId,
       timeoutMs: state.settings.timeouts.downloadStart
     }, state.settings.timeouts.downloadStart + 3000, "请求单文件下载地址");
+    const businessCode = Number(lastResponse?.body?.code ?? lastResponse?.body?.status);
+    const httpStatus = Number(lastResponse?.status) || 0;
+    if (businessCode === 405 || httpStatus === 401 || httpStatus === 403) {
+      const error = Object.assign(
+        new Error(`POPO 拒绝获取下载地址：${pageApiErrorDetail(lastResponse)}`),
+        { code: "POPO_PERMISSION_DENIED", httpStatus,
+          businessCode, failureStage: FAILURE.DOWNLOAD_NOT_ESTABLISHED }
+      );
+      pushRuntimeEvent(state, "DOWNLOAD_PERMISSION_DENIED", "error",
+        "POPO 拒绝获取下载地址；请核对该文件的共享权限", pageApiErrorDetail(lastResponse), {
+          jobId: activeJob(state)?.id || "", itemId: state.preparingItemId || "",
+          failureStage: FAILURE.DOWNLOAD_NOT_ESTABLISHED, reason: "permission_denied",
+          httpStatus: error.httpStatus, businessCode, retryCount: attempt - 1,
+          recoveryCount: Number(state.workerRecoveryCount) || 0
+        });
+      throw error;
+    }
     const directUrl = lastResponse?.ok ? findFirstHttpUrl(lastResponse.body) : "";
     if (directUrl) return directUrl;
     const observed = await sendToWork(state, {
@@ -3675,6 +3768,25 @@ async function syncGopeedTransfers(state, { resumeAfterReconnect = false } = {})
         );
         if (item.status === "pending") await reopenDownloadOperation(state, item);
         else await completeDownloadOperation(state, item, "failed");
+        continue;
+      }
+      if (error?.name === "GopeedContractError" || /Gopeed SDK 返回数据不符合约定/.test(String(error))) {
+        transfer.contractFailures = (transfer.contractFailures || 0) + 1;
+        const exhausted = transfer.contractFailures >= 3;
+        item.stage = exhausted ? "Gopeed 返回数据异常，已暂停核对" : "Gopeed 返回数据异常，等待重新读取";
+        if (exhausted) {
+          state.pauseOrigin = "gopeed_contract";
+          state.pauseResumeMode = state.mode === "scanning" ? "scanning" : "downloading";
+          state.mode = "paused";
+          state.phase = "gopeed_data_invalid";
+        }
+        pushRuntimeEvent(state, "GOPEED_DATA_INVALID", exhausted ? "error" : "warn",
+          exhausted ? "Gopeed 任务数据连续异常，已暂停自动接续" : "Gopeed 任务数据格式异常，稍后重新读取",
+          String(error?.message || error), {
+            jobId: activeJob(state)?.id || "", taskId: transfer.taskId,
+            failureStage: FAILURE.TRANSFER_INTERRUPTED, reason: "invalid_response",
+            retryCount: transfer.contractFailures, recoveryCount: Number(state.workerRecoveryCount) || 0
+          });
         continue;
       }
       connectionProblem = true;
@@ -4142,7 +4254,8 @@ async function processDownloadStep(state, { duringScan = false, skipTransferSync
       });
       await waitForWorkerReconnect(
         state,
-        `POPO 页面刷新中：${item.name} 稍后自动继续，本次不计失败`
+        `POPO 页面刷新中：${item.name} 稍后自动继续，本次不计失败`,
+        /加载超时/.test(String(error?.message || "")) ? "worker_frame_timeout" : "worker_message_interrupted"
       );
       return;
     }
@@ -5886,6 +5999,10 @@ async function runWatchdog() {
   if (await repairQueueState(state)) return;
   if (await reconcileUnownedPausedState(state)) return;
   if (state.mode === "waiting_worker" && state.workerDeadline && Date.now() > state.workerDeadline) {
+    if (state.workerRecoveryStartedAt) {
+      await waitForWorkerReconnect(state, "POPO 页面工作区恢复超时");
+      return;
+    }
     await finalizeActiveJob(
       state,
       "failed",

@@ -1978,6 +1978,35 @@ test("遗漏目录可以重扫整个文件夹而不要求先有失败文件", as
   }
 });
 
+test("重试失败项目只选择未完成文件并保留原已完成记录", async () => {
+  const now = new Date().toISOString();
+  const parentUrl = "https://docs.popo.netease.com/team/pc/team1/pageDetail/root1";
+  const failedKey = `${parentUrl}\u0000failed.jpg`;
+  const source = {
+    id: "job-retry-source", key: "folder-retry-source", sourceTabId: 7,
+    folderName: "素材", folderItemIndex: "2", parentUrl,
+    status: "failed", createdAt: now, completedAt: now,
+    counts: { files: 2, success: 1, failed: 1, scanFailures: 0 },
+    failureRetryKeys: [failedKey]
+  };
+  const state = {
+    version: 4, runToken: "run-retry-only-missing", jobs: [source], activeJobId: null,
+    mode: "idle", phase: "idle", settings: { concurrency: 1, gopeedConnections: 1 },
+    items: [], activeTransfers: [], scanQueue: [], resolveQueue: [], scanFailures: [], logs: []
+  };
+  const harness = createHarness({ popoSettings: state.settings, popoState: state });
+  try {
+    const result = await harness.send({ type: "RETRY_JOB", jobId: source.id });
+    assert.equal(result.ok, true);
+    const retry = harness.stored.popoState.jobs.find((job) => job.retryOfJobId === source.id);
+    assert.deepEqual(retry.retryKeys, [failedKey]);
+    assert.equal(harness.stored.popoState.jobs.find((job) => job.id === source.id).counts.success, 1);
+    assert.deepEqual(harness.stored.popoState.activeTransfers, []);
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test("两分钟内一键下载和单独点击都保留已有绿色完整性反馈", async () => {
   const base = "https://docs.popo.netease.com/team/pc/team1/pageDetail/root1";
   const completedKey = makeFolderJobKey({
@@ -3742,6 +3771,138 @@ test("手动暂停和继续 Gopeed 任务时项目保持运行并持续对账", 
     harness.cleanup();
   }
 });
+
+test("Gopeed 数据契约连续异常会暂停项目而不误报断线或重建任务", async () => {
+  const state = transferState();
+  state.gopeedConnected = true;
+  const harness = createHarness({ popoSettings: state.settings, popoState: state }, {
+    async getGopeedTask() { throw new Error("Gopeed SDK 返回数据不符合约定：meta.res Invalid input"); }
+  });
+  try {
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      harness.fireAlarm("popo-stable-downloader-pump");
+      await waitUntil(() => harness.stored.popoState?.activeTransfers?.[0]?.contractFailures === attempt);
+    }
+    const saved = harness.stored.popoState;
+    assert.equal(saved.mode, "paused");
+    assert.equal(saved.pauseOrigin, "gopeed_contract");
+    assert.equal(saved.activeTransfers[0].taskId, "task-active");
+    assert.equal(saved.logs.some((entry) => entry.code === "GOPEED_CONNECTION_LOST"), false);
+    assert.equal(saved.logs.some((entry) => entry.code === "GOPEED_DATA_INVALID"), true);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("页面工作区恢复超时保留已完成文件并标记未完成项可重试", async () => {
+  const state = transferState({ mode: "waiting_worker", jobStatus: "waiting_worker", includePending: true });
+  state.triggerMode = "folder_button";
+  state.workerFrameId = null;
+  state.workerRecoveryStartedAt = Date.now() - 6 * 60_000;
+  state.workerRecoveryCount = 2;
+  state.workerRecoveryPending = false;
+  state.workerDeadline = Date.now() - 1;
+  state.items[0].status = "success";
+  state.activeTransfers = [];
+  state.scanQueue = [{ url: state.rootUrl, path: ["未扫描目录"] }];
+  const harness = createHarness({ popoSettings: state.settings, popoState: state });
+  try {
+    harness.fireAlarm("popo-stable-downloader-watchdog");
+    await waitUntil(() => harness.stored.popoState?.jobs?.[0]?.status === "failed");
+    const saved = harness.stored.popoState;
+    assert.equal(saved.jobs[0].counts.success, 1);
+    assert.equal(saved.jobs[0].counts.failed, 1);
+    assert.equal(saved.jobs[0].counts.scanFailures, 1);
+    assert.equal(saved.jobs[0].failureRetryKeys.length, 1);
+    assert.equal(saved.logs.find((entry) => entry.code === "WORKER_RECOVERY_PENDING")?.context?.recoveryCount, 3);
+    assert.equal(saved.logs.some((entry) => entry.code === "WORKER_RECOVERY_EXHAUSTED"), true);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+for (const businessField of ["code", "status"]) {
+  test(`POPO 取址 ${businessField} 405 立即标记权限失败且不借页面观察地址继续`, async () => {
+  const state = transferState({ includePending: true });
+  state.items = [{ ...state.items[1], name: "denied.jpg", itemIndex: "5" }];
+  state.activeTransfers = [];
+  state.activeItemId = null;
+  state.triggerMode = "folder_button";
+  state.teamSpaceId = "space-real";
+  state.gopeedConnected = true;
+  state.gopeedDownloadDir = "D:\\Downloads";
+  let currentUrl = state.rootUrl;
+  let requestCount = 0;
+  let observedCount = 0;
+  let sendRuntimeMessage;
+  const harness = createHarness({ popoSettings: state.settings, popoState: state }, {
+    async listGopeedTasks() { return []; },
+    async sendTabMessage(_tabId, message) {
+      if (message.type === "NAVIGATE_WORKER") {
+        currentUrl = message.url;
+        setTimeout(() => {
+          void sendRuntimeMessage(
+            { type: "REGISTER_WORKER_FRAME", url: message.url },
+            { tab: { id: 7, url: message.url }, url: message.url, frameId: 42 }
+          );
+        }, 0);
+        return { ok: true };
+      }
+      if (message.type === "PING") return { ok: true, result: { url: currentUrl } };
+      if (message.type === "OPEN_ITEM") {
+        currentUrl = "https://docs.popo.netease.com/team/pc/team1/pageDetail/denied1";
+        return { ok: true, result: { clicked: true } };
+      }
+      if (message.type === "GET_PREVIEW_INFO") return { ok: true, result: {
+        titleCandidates: ["denied.jpg"], media: [], downloadButtonCount: 1,
+        loadingCount: 0, previewElementCount: 1, pageId: "denied1"
+      } };
+      if (message.type === "RESOLVE_TEAM_SPACE_ID") return {
+        ok: true, result: { ok: true, status: 200, body: { code: 0, data: "space-real" } }
+      };
+      if (message.type === "REQUEST_DIRECT_DOWNLOAD") {
+        requestCount += 1;
+        return { ok: true, result: { ok: true, status: 200, body: {
+          [businessField]: 405, message: "没有权限操作", data: { url: "https://example.com/should-not-use" }
+        } } };
+      }
+      if (message.type === "GET_OBSERVED_DOWNLOAD_URL") {
+        observedCount += 1;
+        return { ok: true, result: { url: "https://example.com/should-not-use" } };
+      }
+      return { ok: true, result: {} };
+    }
+  });
+  sendRuntimeMessage = harness.send;
+  try {
+    harness.fireAlarm("popo-stable-downloader-pump");
+    try {
+      await waitUntil(() => harness.stored.popoState?.jobs?.[0]?.counts?.failed === 1);
+    } catch (error) {
+      assert.fail(`${error.message}: ${JSON.stringify({
+        mode: harness.stored.popoState?.mode,
+        phase: harness.stored.popoState?.phase,
+        logs: harness.stored.popoState?.logs?.slice(-3),
+        messages: harness.sentTabMessages.map((entry) => entry.message.type)
+      })}`);
+    }
+    assert.equal(requestCount, 1);
+    assert.equal(observedCount, 0);
+    assert.equal(harness.stored.popoState.jobs[0].failureRetryKeys.length, 1);
+    assert.equal(harness.stored.popoState.logs.some((entry) => entry.code === "DOWNLOAD_PERMISSION_DENIED"), true);
+    const denial = harness.stored.popoState.logs.find((entry) => entry.code === "DOWNLOAD_PERMISSION_DENIED");
+    assert.equal(denial?.context?.businessCode, 405);
+    assert.match(denial?.details || "", new RegExp(`${businessField} 405`));
+    const diagnostic = harness.stored.popoState.pendingDiagnostics.find(
+      (entry) => entry.code === "DOWNLOAD_PERMISSION_DENIED"
+    );
+    assert.equal(diagnostic?.context?.httpStatus, 200);
+    assert.equal(diagnostic?.context?.businessCode, 405);
+  } finally {
+    harness.cleanup();
+  }
+  });
+}
 
 test("Gopeed 关闭并自动重启后只恢复断线前正在运行的 POPO 任务", async () => {
   const state = transferState({ includePending: true });
