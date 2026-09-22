@@ -1,10 +1,9 @@
-@echo off
-setlocal
+﻿@echo off
 chcp 65001 >nul
-title POPO 下载助手 - 安装与更新维护
+title POPO 下载助手安装与维护
 
-if exist "%~dp0POPO-Dev-Setup.exe" (
-  start "" "%~dp0POPO-Dev-Setup.exe"
+if exist "%~dp0popo-setup.exe" (
+  start "" "%~dp0popo-setup.exe"
   exit /b 0
 )
 if exist "%~dp0popo-dev-setup.exe" (
@@ -15,8 +14,8 @@ if exist "%~dp0POPO-Setup.exe" (
   start "" "%~dp0POPO-Setup.exe"
   exit /b 0
 )
-if exist "%~dp0popo-setup.exe" (
-  start "" "%~dp0popo-setup.exe"
+if exist "%~dp0POPO-Dev-Setup.exe" (
+  start "" "%~dp0POPO-Dev-Setup.exe"
   exit /b 0
 )
 if exist "%~dp0native-host\install.ps1" (
