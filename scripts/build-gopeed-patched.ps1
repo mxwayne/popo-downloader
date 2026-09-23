@@ -79,12 +79,20 @@ try {
 }
 
 Push-Location $flutterRoot
+$previousCl = $env:CL
 try {
   & $FlutterExecutable pub get
   if ($LASTEXITCODE -ne 0) { throw 'Resolving Gopeed Flutter dependencies failed.' }
+  # New Windows hosted images ship an MSVC STL that promotes the legacy
+  # coroutine header deprecation to an error. This pinned Gopeed dependency
+  # still includes plugins using that header; MSVC documents this macro as
+  # the compatibility opt-out while those dependencies migrate.
+  $env:CL = (@($previousCl, '/D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS') |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ' '
   & $FlutterExecutable build windows '--dart-define=UPDATE_CHANNEL=windowsPortable'
   if ($LASTEXITCODE -ne 0) { throw 'Building the POPO-patched Gopeed desktop application failed.' }
 } finally {
+  $env:CL = $previousCl
   Pop-Location
 }
 
