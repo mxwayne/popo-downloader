@@ -57,7 +57,7 @@ jobs:
       - name: Verify Dev artifacts exist
         shell: pwsh
         run: |
-          $packages = @(Get-ChildItem -LiteralPath dist -Filter 'POPO-Dev-Downloader-*-win-x64.zip' -File)
+          $packages = @(Get-ChildItem -LiteralPath dist -Filter 'popo-dev-downloader-*-win-x64.zip' -File)
           if ($packages.Count -ne 1) {
             throw "Expected exactly one Dev ZIP, found $($packages.Count)."
           }
@@ -71,7 +71,7 @@ jobs:
         with:
           name: popo-dev-windows-${{ github.sha }}
           path: |
-            dist/POPO-Dev-Downloader-*-win-x64.zip
-            dist/POPO-Dev-Downloader-*-win-x64.zip.sha256.txt
+            dist/popo-dev-downloader-*-win-x64.zip
+            dist/popo-dev-downloader-*-win-x64.zip.sha256.txt
           if-no-files-found: error
           retention-days: 7
