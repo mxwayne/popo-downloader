@@ -125,6 +125,9 @@ patch="$scratch/working-tree.patch"
 untracked_list="$scratch/untracked-files"
 untracked_archive="$scratch/untracked-files.tar.gz"
 origin_url=$(git -C "$repo_root" remote get-url origin)
+if [[ $origin_url =~ ^git@github\.com:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git)$ ]]; then
+  origin_url="https://github.com/${BASH_REMATCH[1]}"
+fi
 source_kind=origin
 
 if [[ ! $origin_url =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git$ ]]; then
