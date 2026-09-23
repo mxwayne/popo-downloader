@@ -63,9 +63,9 @@ $requiredEntries = @(
 $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
 try {
   $entryNames = @($archive.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
-  $hasSetup = ($entryNames -contains "$expectedName/popo-dev-setup.exe") -or 
-              ($entryNames -contains "$expectedName/popo-setup.exe") -or 
-              ($entryNames -contains "$expectedName/POPO-Dev-Setup.exe") -or 
+  $hasSetup = ($entryNames -contains "$expectedName/popo-dev-setup.exe") -or
+              ($entryNames -contains "$expectedName/popo-setup.exe") -or
+              ($entryNames -contains "$expectedName/POPO-Dev-Setup.exe") -or
               ($entryNames -contains "$expectedName/POPO-Setup.exe")
   if (-not $hasSetup) {
     throw "Official ZIP is missing a Bootstrapper requirement: setup executable in $expectedName"
