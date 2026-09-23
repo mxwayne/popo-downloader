@@ -49,6 +49,9 @@ jobs:
           cache: npm
           cache-dependency-path: release-source/package-lock.json
 
+      - name: Set up Gopeed build toolchain
+        uses: ./automation/.github/actions/setup-gopeed-toolchain
+
       - name: Validate tag and version metadata
         shell: pwsh
         run: powershell -NoProfile -ExecutionPolicy Bypass -File automation/scripts/assert-release-version.ps1 -Tag $env:RELEASE_TAG -RepoRoot release-source

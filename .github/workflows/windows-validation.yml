@@ -33,6 +33,9 @@ jobs:
           node-version: 24
           cache: npm
 
+      - name: Set up Gopeed build toolchain
+        uses: ./.github/actions/setup-gopeed-toolchain
+
       - name: Install dependencies
         shell: pwsh
         run: |

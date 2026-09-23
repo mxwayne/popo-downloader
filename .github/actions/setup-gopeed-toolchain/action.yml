@@ -1,0 +1,60 @@
+name: Set up pinned Gopeed build toolchain
+description: Install the exact Go, Flutter, and LLVM-MinGW versions used to build bundled Gopeed.
+runs:
+  using: composite
+  steps:
+    - name: Set up Go
+      uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+      with:
+        go-version: 1.24.11
+        cache: false
+
+    - name: Set up Flutter
+      uses: subosito/flutter-action@395322a6cded4e9ed503aebd4cc1965625f8e59a # v2.20.0
+      with:
+        flutter-version: 3.41.2
+        channel: stable
+        cache: false
+
+    - name: Install pinned LLVM-MinGW
+      shell: pwsh
+      run: |
+        $version = '20260922'
+        $archiveName = "llvm-mingw-$version-ucrt-x86_64.zip"
+        $downloadUrl = "https://github.com/mstorsjo/llvm-mingw/releases/download/$version/$archiveName"
+        $expectedSha256 = 'e3ad77d117a4bea19a7a3b333341824d79a5a371004a10e25b8504e7b3047666'
+        $toolingRoot = Join-Path $env:RUNNER_TEMP 'popo-gopeed-tooling'
+        $archivePath = Join-Path $toolingRoot $archiveName
+        $extractRoot = Join-Path $toolingRoot 'extract'
+        $sourceRoot = Join-Path $extractRoot "llvm-mingw-$version-ucrt-x86_64"
+        $llvmRoot = Join-Path $toolingRoot 'llvm-mingw'
+
+        New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $archivePath
+        $actualSha256 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualSha256 -ne $expectedSha256) {
+          throw 'The pinned LLVM-MinGW archive SHA-256 does not match.'
+        }
+        Expand-Archive -LiteralPath $archivePath -DestinationPath $extractRoot
+        if (-not (Test-Path -LiteralPath (Join-Path $sourceRoot 'bin\clang.exe') -PathType Leaf) -or
+            -not (Test-Path -LiteralPath (Join-Path $sourceRoot 'bin\clang++.exe') -PathType Leaf) -or
+            -not (Test-Path -LiteralPath (Join-Path $sourceRoot 'bin\libc++.dll') -PathType Leaf) -or
+            -not (Test-Path -LiteralPath (Join-Path $sourceRoot 'bin\libunwind.dll') -PathType Leaf)) {
+          throw 'The pinned LLVM-MinGW archive is missing required compiler or runtime files.'
+        }
+        Move-Item -LiteralPath $sourceRoot -Destination $llvmRoot
+        Add-Content -LiteralPath $env:GITHUB_ENV -Value "POPO_LLVM_MINGW_ROOT=$llvmRoot"
+        Add-Content -LiteralPath $env:GITHUB_ENV -Value "CC=$llvmRoot\bin\clang.exe"
+        Add-Content -LiteralPath $env:GITHUB_ENV -Value "CXX=$llvmRoot\bin\clang++.exe"
+        Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $llvmRoot 'bin')
+        $goVersion = (& go version 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0 -or $goVersion -notmatch 'go1\.24\.11') {
+          throw "The pinned Go version is not active: $goVersion"
+        }
+        $flutterVersion = (& flutter --version 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0 -or $flutterVersion -notmatch 'Flutter 3\.41\.2') {
+          throw "The pinned Flutter version is not active: $flutterVersion"
+        }
+        Write-Output "Go: $goVersion"
+        Write-Output "Flutter: $flutterVersion"
+        Write-Output "LLVM-MinGW: $version (SHA-256 verified)"
