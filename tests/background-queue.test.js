@@ -2408,6 +2408,70 @@ test("Gopeed 旧成功记录对应文件已不存在时不会误判已下载", a
   }
 });
 
+test("本机去重核对多次失败时停止该文件并保留重试，避免重复创建任务", async () => {
+  const state = transferState({ includePending: true });
+  const pending = state.items.find((item) => item.id === "pending-file");
+  pending.directoryPath = [state.selectedFolderName];
+  const stableLabels = buildTaskIdentityLabels({
+    jobId: "job-previous-download",
+    taskIdentity: pending.id
+  });
+  state.items = [pending];
+  state.activeTransfers = [];
+  state.activeItemId = null;
+  state.workerFrameId = null;
+  state.jobs[0].counts = { files: 1 };
+  let verifyAttempts = 0;
+  const harness = createHarness(
+    { popoSettings: state.settings, popoState: state },
+    {
+      gopeedConfig: { downloadDir: "D:\\Downloads" },
+      gopeedTasks: [{
+        id: "task-stale-done",
+        status: "done",
+        meta: {
+          req: { labels: { source: "popo-stable-downloader", ...stableLabels } },
+          opts: {
+            path: "D:\\Downloads\\POPO稳定下载\\已删除目录",
+            name: "pending.mp4"
+          },
+          res: { files: [{ name: "pending.mp4", size: 2048 }] }
+        }
+      }],
+      async sendNativeMessage(_host, message) {
+        if (message.action === "verify_files") {
+          verifyAttempts += 1;
+          throw new Error("native host pipe disconnected");
+        }
+        return { ok: true };
+      }
+    }
+  );
+  try {
+    harness.fireAlarm("popo-stable-downloader-pump");
+    await waitUntil(() => harness.stored.popoState?.phase === "checking_download_files");
+    assert.equal(verifyAttempts, 1);
+
+    harness.fireAlarm("popo-stable-downloader-pump");
+    await waitUntil(() => verifyAttempts === 2);
+
+    harness.fireAlarm("popo-stable-downloader-pump");
+    await waitUntil(() => harness.stored.popoState?.logs?.some((entry) =>
+      entry.code === "DOWNLOAD_DEDUPE_VERIFY_FAILED"
+    ));
+    assert.ok(harness.stored.popoState.logs.some((entry) =>
+      entry.code === "DOWNLOAD_DEDUPE_VERIFY_FAILED"
+    ));
+    const storedItem = harness.stored["popoItems:job-gopeed-control:0"][0];
+    assert.equal(storedItem.status, "failed");
+    assert.equal(storedItem.failureStage, "本地文件核对");
+    assert.equal(storedItem.attempts, 0);
+    assert.equal(harness.sentTabMessages.some(({ message }) => message.type === "OPEN_ITEM"), false);
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test("Gopeed 成功记录读取失败时保持排队且不创建下载", async () => {
   const state = transferState({ includePending: true });
   const pending = state.items.find((item) => item.id === "pending-file");

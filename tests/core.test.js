@@ -472,8 +472,13 @@ test("Windows 保留名称在有无扩展名时都安全改名", () => {
     "NUL",
     "COM1.txt",
     "COM9",
+    "COM0.bin",
     "LPT1.psd",
-    "LPT9.zip"
+    "LPT9.zip",
+    "LPT0",
+    "CLOCK$",
+    "CONIN$.txt",
+    "CONOUT$.log"
   ]) {
     assert.equal(sanitizePathSegment(name), `_${name}`, name);
   }

@@ -23,6 +23,7 @@ const {
   deleteTask: deleteGopeedTask,
   getConfig: getGopeedConfig,
   getTask: getGopeedTask,
+  isTaskNotFoundError: isGopeedTaskNotFoundError,
   listTasks: listGopeedTasks,
   normalizeDownloadDirectory: normalizeGopeedDownloadDirectory,
   normalizeEndpoint: normalizeGopeedEndpoint,
@@ -3435,8 +3436,23 @@ function pageApiErrorDetail(response) {
 
 async function ensureTeamSpaceId(state) {
   if (state.teamSpaceId) return state.teamSpaceId;
-  const teamSpaceKey = state.teamSpaceKey ||
-    new URL(state.rootUrl).pathname.match(/\/team\/pc\/([^/]+)/i)?.[1] || "";
+  let teamSpaceKey = state.teamSpaceKey || "";
+  if (!teamSpaceKey) {
+    const candidateUrls = [
+      state.rootUrl,
+      ...(state.items || []).map((item) => item.rootUrl || item.parentUrl),
+      activeJob(state)?.parentUrl
+    ].filter(Boolean);
+    for (const candidate of candidateUrls) {
+      try {
+        const match = new URL(candidate).pathname.match(/\/team\/pc\/([^/]+)/i)?.[1];
+        if (match) {
+          teamSpaceKey = match;
+          break;
+        }
+      } catch {}
+    }
+  }
   if (!teamSpaceKey) throw new Error("没有识别到 POPO 团队空间标识");
   const response = await sendToWork(state, {
     type: "RESOLVE_TEAM_SPACE_ID",
@@ -3750,7 +3766,7 @@ async function syncGopeedTransfers(state, { resumeAfterReconnect = false } = {})
         }
       }
     } catch (error) {
-      if (error?.code === 2001) {
+      if (error?.code === 2001 || isGopeedTaskNotFoundError(error)) {
         pushRuntimeEvent(
           state,
           "GOPEED_TASK_MISSING",
@@ -4079,27 +4095,52 @@ async function processDownloadStep(state, { duringScan = false, skipTransferSync
   const candidateRecords = successfulDownloadCandidates(downloadHistory, identityKey, targetKey);
   let verifiedRecords = [];
   if (candidateRecords.length) {
+    const job = activeJob(state);
     try {
       verifiedRecords = await verifySuccessfulDownloadCandidates(
         state,
         downloadHistory,
         candidateRecords
       );
+      if (job) job.downloadDedupeFailures = 0;
     } catch (error) {
       const detail = String(error?.message || error).replace(/^Error:\s*/, "");
-      const job = activeJob(state);
+      const dedupeFailures = ((job?.downloadDedupeFailures) || 0) + 1;
+      if (job) {
+        job.downloadDedupeError = detail;
+        job.downloadDedupeFailures = dedupeFailures;
+      }
+      if (dedupeFailures <= 2) {
+        pushRuntimeEvent(
+          state,
+          "DOWNLOAD_DEDUPE_FILE_VERIFY_ERROR",
+          "warn",
+          "暂时无法核对本地已下载文件，稍后重试核对",
+          `${detail}（第 ${dedupeFailures}/2 次尝试）`,
+          { jobId: job?.id || "", itemId: item.id }
+        );
+        state.phase = "checking_download_files";
+        await saveState(state);
+        schedulePump(2000);
+        return;
+      }
       pushRuntimeEvent(
         state,
-        "DOWNLOAD_DEDUPE_FILE_VERIFY_ERROR",
-        "warn",
-        "暂时无法核对本地已下载文件，未创建新下载任务",
+        "DOWNLOAD_DEDUPE_VERIFY_FAILED",
+        "error",
+        "本地已下载文件核对多次失败，已停止该文件以避免重复下载",
         detail,
-        { jobId: job?.id || "", itemId: item.id }
+        { jobId: job?.id || "", itemId: item.id, dedupeFailures }
       );
-      if (job) job.downloadDedupeError = detail;
+      item.status = "failed";
+      item.stage = "本地已下载文件核对失败";
+      item.failureStage = "本地文件核对";
+      item.error = detail;
+      item.completedAt = new Date().toISOString();
+      if (job) job.downloadDedupeFailures = 0;
       state.phase = "checking_download_files";
       await saveState(state);
-      schedulePump(2000);
+      schedulePump(100);
       return;
     }
   }

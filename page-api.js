@@ -81,22 +81,53 @@
   } catch {}
 
   /**
+   * 清洗并规范化访问令牌字符串，剔除可能包裹的双引号、反斜杠转义或首尾空白字符，
+   * 并支持从 JSON 序列化对象中提取 accessToken / token 字段。
+   * 避免由于 JSON.stringify(token) 存入 storage 导致带引号的 Authorization 请求头被网关判定为 405/401。
+   */
+  function normalizeAuthToken(raw) {
+    if (!raw || typeof raw !== "string") return "";
+    let token = raw.trim();
+    if (token.startsWith("{") && token.endsWith("}")) {
+      try {
+        const parsed = JSON.parse(token);
+        if (parsed && typeof parsed === "object") {
+          token = String(parsed.accessToken || parsed.token || parsed.authToken || parsed.popo_token || "").trim();
+        }
+      } catch {}
+    }
+    if (token.startsWith('"') && token.endsWith('"') && token.length >= 2) {
+      token = token.slice(1, -1).trim();
+    }
+    token = token.replace(/\\"/g, '"');
+    return token;
+  }
+
+  /**
    * 从 Cookie 或 Web Storage 中解析当前登录用户的访问令牌。
    * POPO 页面在调用取址与鉴权接口时，要求在 Request Headers 中显式携带 Authorization 与 Devicetype，
    * 否则网关会将请求判定为未授权访客并返回 status: 405 (没有权限操作)。
    */
   function resolveAuthToken() {
     try {
-      const match = document.cookie.match(/(?:^|;\s*)accessToken=([^;]+)/);
-      if (match && match[1]) return decodeURIComponent(match[1]);
+      const match = document.cookie.match(/(?:^|;\s*)(?:accessToken|token|popo_token)=([^;]+)/i);
+      if (match && match[1]) {
+        const decoded = decodeURIComponent(match[1]);
+        const cleaned = normalizeAuthToken(decoded);
+        if (cleaned) return cleaned;
+      }
     } catch {}
     try {
-      return window.localStorage.getItem("accessToken") ||
-             window.sessionStorage.getItem("accessToken") ||
-             "";
-    } catch {
-      return "";
-    }
+      for (const storage of [window.localStorage, window.sessionStorage]) {
+        if (!storage) continue;
+        for (const key of ["accessToken", "token", "popo_token", "authToken", "popoToken"]) {
+          const val = storage.getItem(key);
+          const cleaned = normalizeAuthToken(val);
+          if (cleaned) return cleaned;
+        }
+      }
+    } catch {}
+    return "";
   }
 
   window.addEventListener("message", async (event) => {
@@ -107,9 +138,25 @@
     try {
       requestUrl = new URL(path, window.location.origin);
     } catch {
+      window.postMessage({
+        source: RESPONSE_SOURCE,
+        requestId,
+        ok: false,
+        status: 400,
+        error: "无效的请求路径"
+      }, window.location.origin);
       return;
     }
-    if (requestUrl.origin !== window.location.origin || !ALLOWED_PATHS.has(requestUrl.pathname)) return;
+    if (requestUrl.origin !== window.location.origin || !ALLOWED_PATHS.has(requestUrl.pathname)) {
+      window.postMessage({
+        source: RESPONSE_SOURCE,
+        requestId,
+        ok: false,
+        status: 403,
+        error: "请求目标不在允许的白名单接口列表中"
+      }, window.location.origin);
+      return;
+    }
 
     try {
       const headers = {

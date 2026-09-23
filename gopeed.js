@@ -403,6 +403,14 @@
     });
   }
 
+  function isTaskNotFoundError(error) {
+    if (!error) return false;
+    if (error.code === 2001 || error.httpStatus === 404) return true;
+    const message = String(error.message || error).toLowerCase();
+    return message.includes("task not found") || message.includes("record not found") ||
+      message.includes("任务不存在") || message.includes("任务未找到");
+  }
+
   async function startOrReplaceTask(settings, existingTaskId, task, options = {}) {
     if (existingTaskId) {
       try {
@@ -410,7 +418,7 @@
         await continueTask(settings, existingTaskId, options);
         return { taskId: existingTaskId, replacedMissingTask: false };
       } catch (error) {
-        if (error?.code !== 2001) throw error;
+        if (!isTaskNotFoundError(error)) throw error;
       }
     }
     const taskId = await createTask(settings, task, options);
@@ -445,6 +453,7 @@
     deleteTask,
     getConfig,
     getTask,
+    isTaskNotFoundError,
     listTasks,
     normalizeDownloadDirectory,
     normalizeEndpoint,

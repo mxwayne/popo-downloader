@@ -226,7 +226,7 @@
       .trim();
     const usable = cleaned || "未命名";
     const reservedStem = usable.split(".", 1)[0].replace(/[. ]+$/g, "").toUpperCase();
-    if (/^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/.test(reservedStem)) {
+    if (/^(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9]|CONIN\$|CONOUT\$|CLOCK\$)$/.test(reservedStem)) {
       return `_${usable}`;
     }
     return usable;

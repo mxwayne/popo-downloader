@@ -371,6 +371,9 @@ test("下载地址与页面命令都执行来源白名单检查", () => {
   assert.match(core, /\.s3v2\.nie\.netease\.com/);
   assert.match(core, /url\.protocol !== "https:"/);
   assert.match(pageApi, /endsWith\("\.s3v2\.nie\.netease\.com"\)/);
+  assert.match(pageApi, /normalizeAuthToken/);
+  assert.match(pageApi, /headers\.Authorization = authToken/);
+  assert.match(pageApi, /status:\s*403/);
   assert.match(background, /assertTrustedRuntimeSource\(command, sender\)/);
   assert.match(background, /后台拒绝跨 POPO 团队空间的页面命令/);
   assert.match(background, /const validatedUrl = validateDownloadUrl\(url\)/);
