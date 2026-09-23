@@ -141,7 +141,7 @@ export const GopeedTaskSchema = z.looseObject({
         path: z.string().max(32768).optional(),
         size: z.number().finite().nonnegative().optional()
       })).optional()
-    }).optional(),
+    }).nullable().optional(),
     opts: z.looseObject({
       name: z.string().max(32768).optional(),
       path: z.string().max(32768).optional()

@@ -26,6 +26,7 @@
     "verify:windows:remote": "bash scripts/remote-windows-dev.sh",
     "smoke:windows": "node scripts/print-windows-smoke.mjs",
     "smoke:windows:download": "node scripts/print-windows-smoke.mjs --download-logic",
+    "smoke:filename-site": "node scripts/filename-smoke-server.mjs",
     "dev:extension:sync": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/sync-dev-extension.ps1",
     "test:dev-extension:sync": "node --test tests/dev-extension-sync.test.js",
     "build:test-package": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-test-package.ps1 -Channel Dev",
@@ -35,7 +36,9 @@
     "test:release-candidate:preflight": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-release-candidate-install.ps1",
     "test:release-candidate:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-release-candidate-install.ps1 -RunAcceptance",
     "release:check-version": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/assert-release-version.ps1",
-    "release:notes": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/get-release-notes.ps1"
+    "release:notes": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/get-release-notes.ps1",
+    "design": "node scripts/design-preview.mjs",
+    "build:design": "node scripts/design-preview.mjs --build"
   },
   "dependencies": {
     "@gopeed/rest": "1.7.0",

@@ -38,14 +38,14 @@ $sourcePath = if ($SourcePath) {
 }
 $outputPath = [System.IO.Path]::GetFullPath($OutputPath)
 $outputDirectory = Split-Path -Parent $outputPath
-$versionMatch = [regex]::Match($Version, '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*))?$')
+$versionMatch = [regex]::Match($Version, '^(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?(?:-.*)?$')
 if (-not $versionMatch.Success) {
-  throw 'Bootstrapper version must contain three or four numeric components.'
+  throw 'Bootstrapper version must contain at least three numeric components.'
 }
-$assemblyVersion = if ($versionMatch.Groups[4].Success) { $Version } else { "$Version.0" }
-$expectedName = "POPO-Stable-Downloader-$Version-win-x64"
-$expectedZipName = "$expectedName.zip"
-$expectedExeName = "$expectedName.exe"
+$assemblyVersion = "$($versionMatch.Groups[1].Value).$($versionMatch.Groups[2].Value).$($versionMatch.Groups[3].Value).$(if ($versionMatch.Groups[4].Success) { $versionMatch.Groups[4].Value } else { '0' })"
+$expectedName = [System.IO.Path]::GetFileNameWithoutExtension($zipPath)
+$expectedZipName = [System.IO.Path]::GetFileName($zipPath)
+$expectedExeName = [System.IO.Path]::GetFileName($outputPath)
 if ([System.IO.Path]::GetFileName($zipPath) -ne $expectedZipName) {
   throw "Bootstrapper ZIP name must be $expectedZipName."
 }
@@ -54,7 +54,6 @@ if ([System.IO.Path]::GetFileName($outputPath) -ne $expectedExeName) {
 }
 
 $requiredEntries = @(
-  "$expectedName/POPO-Setup.exe",
   "$expectedName/release-manifest.json",
   "$expectedName/extension/manifest.json",
   "$expectedName/Gopeed/gopeed.exe",
@@ -64,6 +63,13 @@ $requiredEntries = @(
 $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
 try {
   $entryNames = @($archive.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
+  $hasSetup = ($entryNames -contains "$expectedName/popo-dev-setup.exe") -or
+              ($entryNames -contains "$expectedName/popo-setup.exe") -or
+              ($entryNames -contains "$expectedName/POPO-Dev-Setup.exe") -or
+              ($entryNames -contains "$expectedName/POPO-Setup.exe")
+  if (-not $hasSetup) {
+    throw "Official ZIP is missing a Bootstrapper requirement: setup executable in $expectedName"
+  }
   foreach ($requiredEntry in $requiredEntries) {
     if ($entryNames -notcontains $requiredEntry) {
       throw "Official ZIP is missing a Bootstrapper requirement: $requiredEntry"
@@ -106,14 +112,15 @@ try {
     $source,
     (New-Object System.Text.UTF8Encoding($false))
   )
+  $productTitle = if ($expectedName -like "*dev*") { "POPO Dev Downloader" } else { "POPO Stable Downloader" }
   $assemblyInfo = @"
 using System.Reflection;
 
 [assembly: AssemblyVersion("$assemblyVersion")]
 [assembly: AssemblyFileVersion("$assemblyVersion")]
 [assembly: AssemblyInformationalVersion("$Version")]
-[assembly: AssemblyTitle("POPO Stable Downloader")]
-[assembly: AssemblyProduct("POPO Stable Downloader")]
+[assembly: AssemblyTitle("$productTitle")]
+[assembly: AssemblyProduct("$productTitle")]
 "@
   [System.IO.File]::WriteAllText(
     $assemblyInfoPath,

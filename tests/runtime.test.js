@@ -230,6 +230,23 @@ test("Gopeed 官方 SDK 创建任务并由 Zod 校验返回数据", async () => 
   }
 });
 
+test("Gopeed 尚未生成响应元数据时接受 meta.res null", async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async () => response({
+    id: "sdk-task-null-res",
+    status: "running",
+    meta: { res: null },
+    progress: { downloaded: 1024 }
+  });
+  try {
+    const task = await runtime.gopeed.getTask({ gopeedEndpoint: "http://127.0.0.1:9999" }, "sdk-task-null-res");
+    assert.equal(task.status, "running");
+    assert.equal(task.meta.res, null);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test("生产 Gopeed 适配层优先使用官方 SDK", async () => {
   const originalFetch = global.fetch;
   const originalRuntime = global.PopoRuntime;

@@ -320,11 +320,7 @@ internal static class FolderPickerHost
             WriteUpdateStatus(productRoot, "installing", currentVersion, manifest.version, "Installing verified candidate package.");
             ExtractUpdatePackage(archivePath, extractRoot);
             string packageRoot = FindExtractedPackageRoot(extractRoot);
-            string setupExecutable = Path.Combine(packageRoot, "POPO-Setup.exe");
-            if (!File.Exists(setupExecutable))
-            {
-                throw new InvalidDataException("The signed update package is missing POPO-Setup.exe.");
-            }
+            string setupExecutable = ResolveSetupExecutable(packageRoot);
 
             ProcessStartInfo setupInfo = new ProcessStartInfo {
                 FileName = setupExecutable,
@@ -567,6 +563,22 @@ internal static class FolderPickerHost
             throw new InvalidDataException("The update archive must contain exactly one package directory.");
         }
         return roots[0];
+    }
+
+    private static string ResolveSetupExecutable(string packageRoot)
+    {
+        string[] candidates = {
+            "popo-setup.exe",
+            "popo-dev-setup.exe",
+            "POPO-Setup.exe",
+            "POPO-Dev-Setup.exe"
+        };
+        foreach (string name in candidates)
+        {
+            string candidate = Path.Combine(packageRoot, name);
+            if (File.Exists(candidate)) return candidate;
+        }
+        throw new InvalidDataException("The signed update package is missing the setup executable.");
     }
 
     private static object ReadUpdateStatus(string productRoot)

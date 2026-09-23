@@ -66,8 +66,8 @@ test("开发绿色版与正式版使用独立安装身份", () => {
   assert.match(setupSource, /ProductShortName = "POPO Dev"/);
   assert.match(buildSource, /ValidateSet\('Stable', 'Dev'\)/);
   assert.match(buildSource, /\/define:POPO_DEV_BUILD/);
-  assert.match(buildSource, /POPO-Dev-Setup\.exe/);
-  assert.match(buildSource, /POPO-Dev-Downloader-/);
+  assert.match(buildSource, /POPO-Dev-Setup\.exe|popo-dev-setup\.exe/i);
+  assert.match(buildSource, /POPO-Dev-Downloader-|popo-dev-downloader-/i);
   assert.match(buildSource, /Import-Module \$devExtensionModulePath -Force/);
   assert.match(devExtensionModule, /folfhehnopknchpoaajfpboibbhnlanf/);
   assert.match(buildSource, /if \(-not \$isDev\) \{[\s\S]*signature = \$signature/);
@@ -127,7 +127,7 @@ test("绿色安装助手自动准备完整运行目录并引导加载扩展", ()
   assert.match(setupSource, /--skip-register/);
   assert.match(setupSource, /"runtime", "popup\.js"/);
   assert.match(setupSource, /"runtime", "page-ui\.js"/);
-  assert.match(buildSource, /POPO-Setup\.exe/);
+  assert.match(buildSource, /POPO-Setup\.exe|popo-setup\.exe/i);
   assert.match(buildSource, /System\.Drawing\.dll/);
   assert.match(buildSource, /latest\.json/);
   assert.match(buildSource, /channel = 'stable'/);

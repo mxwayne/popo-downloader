@@ -7,6 +7,7 @@ const {
   buildTaskIdentityLabels,
   classifyTaskStatus,
   createTask,
+  isTaskNotFoundError,
   listTasks,
   normalizeDownloadDirectory,
   normalizeEndpoint,
@@ -366,5 +367,46 @@ test("刷新地址时 Gopeed 原任务不存在会自动新建任务", async () 
     }
   });
   assert.deepEqual(result, { taskId: "replacement-task", replacedMissingTask: true });
+  assert.deepEqual(calls.map((entry) => entry.method), ["PATCH", "POST"]);
+});
+
+test("isTaskNotFoundError 准确识别 code 2001、HTTP 404 与错误提示文案", () => {
+  assert.equal(isTaskNotFoundError({ code: 2001 }), true);
+  assert.equal(isTaskNotFoundError({ httpStatus: 404 }), true);
+  assert.equal(isTaskNotFoundError(new Error("task not found")), true);
+  assert.equal(isTaskNotFoundError(new Error("record not found")), true);
+  assert.equal(isTaskNotFoundError(new Error("任务不存在")), true);
+  assert.equal(isTaskNotFoundError(new Error("host not found")), false);
+  assert.equal(isTaskNotFoundError(new Error("network timeout")), false);
+  assert.equal(isTaskNotFoundError(null), false);
+});
+test("刷新地址时 Gopeed 返回 HTTP 404 也能自动新建任务", async () => {
+  const calls = [];
+  const result = await startOrReplaceTask({
+    gopeedEndpoint: "http://127.0.0.1:9999",
+    gopeedToken: ""
+  }, "missing-task-404", {
+    url: "https://example.com/refreshed.mp4",
+    name: "video.mp4",
+    path: "D:\\Downloads",
+    connections: 1
+  }, {
+    fetchImpl: async (url, options) => {
+      calls.push({ url, method: options.method });
+      if (options.method === "PATCH") {
+        return {
+          ok: false,
+          status: 404,
+          async json() { return { code: 1000, msg: "not found", data: null }; }
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        async json() { return { code: 0, data: "replacement-task-404" }; }
+      };
+    }
+  });
+  assert.deepEqual(result, { taskId: "replacement-task-404", replacedMissingTask: true });
   assert.deepEqual(calls.map((entry) => entry.method), ["PATCH", "POST"]);
 });
