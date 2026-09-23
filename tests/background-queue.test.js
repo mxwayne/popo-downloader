@@ -4005,9 +4005,14 @@ test("Gopeed 关闭并自动重启后只恢复断线前正在运行的 POPO 任�
         return { downloadDir: "D:\\Downloads" };
       },
       async sendNativeMessage(_host, message) {
-        assert.deepEqual(message, { action: "ensure_gopeed" });
+        assert.equal(message.action, "ensure_gopeed");
+        assert.equal(message.apiToken, state.settings.gopeedToken || "");
         gopeedRestarted = true;
-        return { ok: true, endpoint: "http://127.0.0.1:32123" };
+        return {
+          ok: true,
+          endpoint: "http://127.0.0.1:32123",
+          apiToken: state.settings.gopeedToken || ""
+        };
       }
     }
   );

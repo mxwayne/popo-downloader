@@ -23,5 +23,39 @@ test("bundled Gopeed is the verified official v1.9.3 portable release", () => {
 
   const license = fs.readFileSync(path.join(vendorRoot, "LICENSE"), "utf8");
   assert.match(license, /GNU GENERAL PUBLIC LICENSE/);
+  const llvmLicense = fs.readFileSync(path.join(vendorRoot, "LLVM-MinGW-LICENSE.TXT"), "utf8");
+  assert.match(llvmLicense, /Apache License v2\.0 with LLVM Exceptions/);
   assert.ok(fs.statSync(path.join(vendorRoot, "Gopeed-v1.9.3-source.zip")).size > 0);
+});
+
+test("Gopeed Dev build generates and persists an API token and publishes it only for local pairing", () => {
+  const patch = fs.readFileSync(path.join(vendorRoot, "popo-api-token-bootstrap.patch"), "utf8");
+  const builder = fs.readFileSync(
+    path.join(__dirname, "..", "scripts", "build-gopeed-patched.ps1"),
+    "utf8"
+  );
+  const nativeHost = fs.readFileSync(
+    path.join(__dirname, "..", "native-host", "FolderPickerHost.cs"),
+    "utf8"
+  );
+  const popup = fs.readFileSync(
+    path.join(__dirname, "..", "src", "ui", "popup-components.tsx"),
+    "utf8"
+  );
+
+  assert.match(patch, /Random\.secure\(\)/);
+  assert.match(patch, /saveStartConfig/);
+  assert.match(patch, /\.popo-api-token\.bridge/);
+  assert.match(builder, /Gopeed-v1\.9\.3-source\.zip/);
+  assert.match(builder, /git -C \$source apply/);
+  assert.match(builder, /'libc\+\+\.dll', 'libunwind\.dll'/);
+  assert.match(
+    fs.readFileSync(path.join(__dirname, "..", "scripts", "build-test-package.ps1"), "utf8"),
+    /gopeed-v1\.9\.3-popo-token-v1/
+  );
+  const packageBuilder = fs.readFileSync(path.join(__dirname, "..", "scripts", "build-test-package.ps1"), "utf8");
+  assert.match(packageBuilder, /LLVM-MinGW-LICENSE\.TXT/);
+  assert.match(nativeHost, /ProtectedData\.Protect/);
+  assert.match(nativeHost, /WriteGopeedTokenBridge\(gopeedPath, apiToken\)/);
+  assert.doesNotMatch(popup, /gopeedApiToken|保存密钥/);
 });

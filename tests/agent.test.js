@@ -60,6 +60,7 @@ function compileNativeHost(output) {
     "/reference:System.IO.Compression.dll",
     "/reference:System.IO.Compression.FileSystem.dll",
     "/reference:System.Web.Extensions.dll",
+    "/reference:System.Security.dll",
     "/out:" + output,
     path.join(repoRoot, "native-host", "FolderPickerHost.cs")
   ], { cwd: repoRoot, encoding: "utf8", windowsHide: true, timeout: 30_000 });

@@ -28,9 +28,10 @@ if (Test-Path -LiteralPath $compiler) {
     /reference:System.Windows.Forms.dll `
     /reference:System.Drawing.dll `
     /reference:System.IO.Compression.dll `
-    /reference:System.IO.Compression.FileSystem.dll `
-    /reference:System.Web.Extensions.dll `
-    /out:$builtExe $sourceFile
+  /reference:System.IO.Compression.FileSystem.dll `
+  /reference:System.Web.Extensions.dll `
+  /reference:System.Security.dll `
+  /out:$builtExe $sourceFile
   if ($LASTEXITCODE -ne 0) {
     throw 'The native folder picker host failed to compile.'
   }

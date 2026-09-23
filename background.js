@@ -1521,7 +1521,8 @@ async function checkGopeedConnection(settings, stateToUpdate = null) {
     firstError = String(error?.message || error).replace(/^Error:\s*/, "");
     try {
       const nativeResult = await chrome.runtime.sendNativeMessage(FOLDER_PICKER_HOST, {
-        action: "ensure_gopeed"
+        action: "ensure_gopeed",
+        apiToken: effectiveSettings.gopeedToken
       });
       if (!nativeResult?.ok || !nativeResult.endpoint) {
         const nativeFailure = new Error(nativeResult?.error || "本机助手没有返回 Gopeed 地址");
@@ -1530,7 +1531,8 @@ async function checkGopeedConnection(settings, stateToUpdate = null) {
       }
       effectiveSettings = mergeSettings({
         ...effectiveSettings,
-        gopeedEndpoint: normalizeGopeedEndpoint(nativeResult.endpoint)
+        gopeedEndpoint: normalizeGopeedEndpoint(nativeResult.endpoint),
+        gopeedToken: String(nativeResult.apiToken || effectiveSettings.gopeedToken || "").trim()
       });
       await chrome.storage.local.set({ popoSettings: effectiveSettings });
       config = await getGopeedConfig(effectiveSettings, { timeoutMs: 5000 });

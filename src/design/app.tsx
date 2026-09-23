@@ -814,7 +814,7 @@ function Components() {
                   <p className="sample-note">
                     展开“诊断与回传”。发送与复制仅改变模拟状态，不连接外部系统。
                   </p>
-                  <footer>版本 0.7.8 · 更新状态文案见下方说明</footer>
+                  <footer>版本 0.7.9 · 更新状态文案见下方说明</footer>
                 </div>
               </fieldset>
             )}

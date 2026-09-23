@@ -1,0 +1,2 @@
+# Unified diff context lines use a leading space to represent empty source lines.
+vendor/gopeed/v1.9.3/popo-api-token-bootstrap.patch whitespace=-blank-at-eol

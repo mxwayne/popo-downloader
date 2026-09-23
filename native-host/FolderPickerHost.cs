@@ -57,7 +57,7 @@ internal static class FolderPickerHost
             }
             if (String.Equals(action, "ensure_gopeed", StringComparison.Ordinal))
             {
-                WriteMessage(EnsureGopeed());
+                WriteMessage(EnsureGopeed(GetString(request, "apiToken")));
                 return 0;
             }
             if (String.Equals(action, "verify_files", StringComparison.Ordinal))
@@ -752,7 +752,7 @@ internal static class FolderPickerHost
         return "\"" + (value ?? "").Replace("\"", "") + "\"";
     }
 
-    private static object EnsureGopeed()
+    private static object EnsureGopeed(string existingToken)
     {
         string maintenanceMessage;
         if (IsMaintenanceActive(out maintenanceMessage))
@@ -777,6 +777,8 @@ internal static class FolderPickerHost
             };
         }
 
+        string apiToken = ResolveGopeedApiToken(gopeedPath, existingToken);
+
         int readyPort;
         int readyProcessId;
         bool readyBundled;
@@ -785,6 +787,7 @@ internal static class FolderPickerHost
             return new {
                 ok = true,
                 endpoint = "http://127.0.0.1:" + readyPort,
+                apiToken = apiToken,
                 bundled = readyBundled,
                 started = false,
                 processId = readyProcessId
@@ -795,6 +798,7 @@ internal static class FolderPickerHost
         int startedProcessId = 0;
         if (FindBundledGopeedProcess(gopeedPath) == 0)
         {
+            WriteGopeedTokenBridge(gopeedPath, apiToken);
             ProcessStartInfo startInfo = new ProcessStartInfo {
                 FileName = gopeedPath,
                 Arguments = "--hidden",
@@ -825,6 +829,7 @@ internal static class FolderPickerHost
                 return new {
                     ok = true,
                     endpoint = "http://127.0.0.1:" + readyPort,
+                    apiToken = apiToken,
                     bundled = readyBundled,
                     started = started,
                     processId = readyProcessId
@@ -839,6 +844,83 @@ internal static class FolderPickerHost
             started = started,
             processId = startedProcessId
         };
+    }
+
+    private static string ResolveGopeedApiToken(string gopeedPath, string existingToken)
+    {
+        string storageRoot = Path.Combine(Path.GetDirectoryName(gopeedPath), "storage");
+        Directory.CreateDirectory(storageRoot);
+        string protectedPath = Path.Combine(storageRoot, ".popo-api-token.dpapi");
+        string bridgePath = Path.Combine(storageRoot, ".popo-api-token.bridge");
+        string token = "";
+
+        if (File.Exists(bridgePath))
+        {
+            try { token = ValidateApiToken(File.ReadAllText(bridgePath, Encoding.UTF8)); }
+            catch { token = ""; }
+            try { File.Delete(bridgePath); } catch { }
+        }
+        if (token.Length == 0 && File.Exists(protectedPath))
+        {
+            try
+            {
+                byte[] protectedBytes = File.ReadAllBytes(protectedPath);
+                byte[] tokenBytes = ProtectedData.Unprotect(
+                    protectedBytes,
+                    Encoding.UTF8.GetBytes("POPO-Gopeed-API-Token-v1"),
+                    DataProtectionScope.CurrentUser
+                );
+                token = ValidateApiToken(Encoding.UTF8.GetString(tokenBytes));
+                Array.Clear(tokenBytes, 0, tokenBytes.Length);
+            }
+            catch { token = ""; }
+        }
+        if (token.Length == 0) token = ValidateApiToken(existingToken);
+        if (token.Length == 0) token = CreateApiToken();
+
+        byte[] clearBytes = Encoding.UTF8.GetBytes(token);
+        byte[] protectedData = ProtectedData.Protect(
+            clearBytes,
+            Encoding.UTF8.GetBytes("POPO-Gopeed-API-Token-v1"),
+            DataProtectionScope.CurrentUser
+        );
+        Array.Clear(clearBytes, 0, clearBytes.Length);
+        string temporaryPath = protectedPath + ".tmp";
+        File.WriteAllBytes(temporaryPath, protectedData);
+        if (File.Exists(protectedPath)) File.Replace(temporaryPath, protectedPath, null);
+        else File.Move(temporaryPath, protectedPath);
+        Array.Clear(protectedData, 0, protectedData.Length);
+        return token;
+    }
+
+    private static void WriteGopeedTokenBridge(string gopeedPath, string token)
+    {
+        string storageRoot = Path.Combine(Path.GetDirectoryName(gopeedPath), "storage");
+        Directory.CreateDirectory(storageRoot);
+        string bridgePath = Path.Combine(storageRoot, ".popo-api-token.bridge");
+        File.WriteAllText(bridgePath, token, new UTF8Encoding(false));
+    }
+
+    private static string ValidateApiToken(string value)
+    {
+        if (String.IsNullOrWhiteSpace(value) || value.Length > 4096) return "";
+        foreach (char character in value)
+        {
+            if (Char.IsControl(character)) return "";
+        }
+        return value.Trim();
+    }
+
+    private static string CreateApiToken()
+    {
+        byte[] bytes = new byte[32];
+        using (RNGCryptoServiceProvider random = new RNGCryptoServiceProvider())
+        {
+            random.GetBytes(bytes);
+        }
+        string token = Convert.ToBase64String(bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+        Array.Clear(bytes, 0, bytes.Length);
+        return token;
     }
 
     private static bool IsMaintenanceActive(out string message)

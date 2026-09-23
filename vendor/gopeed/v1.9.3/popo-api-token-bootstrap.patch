@@ -1,0 +1,45 @@
+--- a/ui/flutter/lib/app/modules/app/controllers/app_controller.dart
++++ b/ui/flutter/lib/app/modules/app/controllers/app_controller.dart
+@@ -1,6 +1,7 @@
+ import 'dart:async';
+ import 'dart:convert';
+ import 'dart:io';
++import 'dart:math';
+ import 'dart:ui';
+ 
+ import 'package:app_links/app_links.dart';
+@@ -496,6 +497,33 @@
+     final saveCfg = Database.instance.getStartConfig();
+     startConfig.value.network = saveCfg?.network ?? defaultCfg.network;
+     startConfig.value.address = saveCfg?.address ?? defaultCfg.address;
+-    startConfig.value.apiToken = saveCfg?.apiToken ?? defaultCfg.apiToken;
++    final bridgeFile = File(path.join(Util.getStorageDir(), '.popo-api-token.bridge'));
++    var bootstrapToken = '';
++    if (await bridgeFile.exists()) {
++      try {
++        bootstrapToken = (await bridgeFile.readAsString()).trim();
++      } finally {
++        await bridgeFile.delete();
++      }
++    }
++    final savedToken = saveCfg?.apiToken.trim() ?? '';
++    final secureRandom = Random.secure();
++    final apiToken = bootstrapToken.isNotEmpty
++        ? bootstrapToken
++        : savedToken.isNotEmpty
++            ? savedToken
++            : base64UrlEncode(List<int>.generate(32, (_) => secureRandom.nextInt(256)))
++                .replaceAll('=', '');
++    startConfig.value.apiToken = apiToken;
++    if (saveCfg == null || savedToken != apiToken) {
++      Database.instance.saveStartConfig(StartConfigEntity(
++          network: startConfig.value.network,
++          address: startConfig.value.address,
++          apiToken: apiToken));
++    }
++    // The host consumes and DPAPI-protects this short-lived bridge file after
++    // discovering Gopeed. It also covers Gopeed's own Windows auto-start path.
++    await File(path.join(Util.getStorageDir(), '.popo-api-token.bridge'))
++        .writeAsString(apiToken, flush: true);
+     return startConfig.value;
+   }

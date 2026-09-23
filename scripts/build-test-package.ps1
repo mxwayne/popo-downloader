@@ -62,6 +62,7 @@ $buildDefinition = if ($isDev) { '/define:POPO_DEV_BUILD' } else { $null }
 $compileRoot = Join-Path ([System.IO.Path]::GetTempPath()) `
   ("popo-package-compile-" + [Guid]::NewGuid().ToString('N'))
 $nativeExecutable = Join-Path $compileRoot 'PopoFolderPickerHost.exe'
+$gopeedPortableForPackage = Join-Path $compileRoot 'gopeed-portable'
 $nativeVersion = (Get-FileHash -LiteralPath $nativeSource -Algorithm SHA256).Hash.ToLowerInvariant()
 $agentExecutable = Join-Path $compileRoot 'PopoAgent.exe'
 $agentVersion = (Get-FileHash -LiteralPath $agentSource -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -98,12 +99,37 @@ if (-not (Test-Path -LiteralPath $compiler)) {
   throw "The Windows .NET Framework compiler was not found: $compiler"
 }
 New-Item -ItemType Directory -Path $compileRoot -Force | Out-Null
+
+$gopeedBuildScript = Join-Path $repoRoot 'scripts\build-gopeed-patched.ps1'
+$toolchainRoot = if ($env:POPO_BUILD_TOOLCHAIN_ROOT) {
+  [System.IO.Path]::GetFullPath($env:POPO_BUILD_TOOLCHAIN_ROOT)
+} else {
+  'D:\POPO\Tooling'
+}
+foreach ($toolDirectory in @(
+  (Join-Path $toolchainRoot 'go\bin'),
+  (Join-Path $toolchainRoot 'flutter\bin')
+)) {
+  if (Test-Path -LiteralPath $toolDirectory -PathType Container) {
+    $env:PATH = "$toolDirectory;$env:PATH"
+  }
+}
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $gopeedBuildScript `
+  -RepoRoot $repoRoot -OutputDirectory $gopeedPortableForPackage
+if ($LASTEXITCODE -ne 0) { throw 'The POPO-patched Gopeed build failed.' }
+
+$gopeedSmokeScript = Join-Path $repoRoot 'scripts\test-gopeed-token-bootstrap.ps1'
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $gopeedSmokeScript `
+  -GopeedDirectory $gopeedPortableForPackage
+if ($LASTEXITCODE -ne 0) { throw 'The Gopeed token bootstrap smoke test failed.' }
+
 & $compiler /nologo /target:winexe /optimize+ /codepage:65001 `
   /reference:System.Windows.Forms.dll `
   /reference:System.Drawing.dll `
   /reference:System.IO.Compression.dll `
   /reference:System.IO.Compression.FileSystem.dll `
   /reference:System.Web.Extensions.dll `
+  /reference:System.Security.dll `
   /out:$nativeExecutable $nativeSource
 if ($LASTEXITCODE -ne 0) { throw 'The native host failed to compile.' }
 
@@ -123,10 +149,12 @@ if ($LASTEXITCODE -ne 0) { throw 'The POPO update agent failed to compile.' }
 if ($LASTEXITCODE -ne 0) { throw 'The green setup assistant failed to compile.' }
 
 foreach ($requiredPath in @(
-  (Join-Path $gopeedPortableRoot 'gopeed.exe'),
+  (Join-Path $gopeedPortableForPackage 'gopeed.exe'),
   (Join-Path $gopeedVendorRoot 'LICENSE'),
   (Join-Path $gopeedVendorRoot 'metadata.json'),
   $gopeedSourceArchive,
+  (Join-Path $gopeedVendorRoot 'popo-api-token-bootstrap.patch'),
+  (Join-Path $gopeedVendorRoot 'LLVM-MinGW-LICENSE.TXT'),
   $nativeExecutable,
   $agentExecutable,
   $setupExecutable,
@@ -213,16 +241,18 @@ $componentManifest = [ordered]@{
 Copy-Item -LiteralPath (Join-Path $stagingRoot 'release-manifest.json') `
   -Destination (Join-Path $agentRoot 'bin\release-manifest.json')
 
-Get-ChildItem -LiteralPath $gopeedPortableRoot -Force |
+Get-ChildItem -LiteralPath $gopeedPortableForPackage -Force |
   Copy-Item -Destination $gopeedRoot -Recurse -Force
 [System.IO.File]::WriteAllText(
-  (Join-Path $gopeedRoot '.popo-bundle-version'),
-  'gopeed-v1.9.3',
+(Join-Path $gopeedRoot '.popo-bundle-version'),
+  'gopeed-v1.9.3-popo-token-v1',
   (New-Object System.Text.UTF8Encoding($false))
 )
 Copy-Item -LiteralPath (Join-Path $gopeedVendorRoot 'LICENSE') -Destination $gopeedLicenseRoot
 Copy-Item -LiteralPath (Join-Path $gopeedVendorRoot 'metadata.json') -Destination $gopeedLicenseRoot
 Copy-Item -LiteralPath $gopeedSourceArchive -Destination $gopeedLicenseRoot
+Copy-Item -LiteralPath (Join-Path $gopeedVendorRoot 'popo-api-token-bootstrap.patch') -Destination $gopeedLicenseRoot
+Copy-Item -LiteralPath (Join-Path $gopeedVendorRoot 'LLVM-MinGW-LICENSE.TXT') -Destination $gopeedLicenseRoot
 
 Compress-Archive -LiteralPath $stagingRoot -DestinationPath $zipPath -CompressionLevel Optimal
 $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()

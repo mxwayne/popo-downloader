@@ -30,7 +30,7 @@ POPO 原来的“三个点 → 下载”保持不变，仍然可以用于服务�
 
 `Gopeed默认下载目录/POPO稳定下载/所选文件夹名/原目录结构/文件名`
 
-本机助手负责显示 Windows 文件夹选择窗口，以及启动并发现包内 Gopeed 的本地 API；它不读取 POPO 文件。`native-host\install.ps1` 只保留用于开发调试，普通测试者不需要运行：
+本机助手负责显示 Windows 文件夹选择窗口，以及启动并发现包内 Gopeed 的本地 API；它不读取 POPO 文件。首次配对时会自动生成 Gopeed API 密钥并保存到 Gopeed 原有设置和 Windows 当前用户 DPAPI，不需要用户在 Gopeed 与扩展之间手工复制密钥。下载历史、任务库和下载目录继续使用原有存储。`native-host\install.ps1` 只保留用于开发调试，普通测试者不需要运行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\native-host\install.ps1 -BundledGopeedRoot .\Gopeed

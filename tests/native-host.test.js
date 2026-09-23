@@ -13,6 +13,13 @@ test("本机助手以 Native Messaging 提供受限的系统操作", () => {
   assert.match(source, /FolderBrowserDialog/);
   assert.match(source, /String\.Equals\(action, "ping"/);
   assert.match(source, /String\.Equals\(action, "ensure_gopeed"/);
+  assert.match(source, /EnsureGopeed\(GetString\(request, "apiToken"\)\)/);
+  assert.match(source, /ResolveGopeedApiToken/);
+  assert.match(source, /ProtectedData\.Protect/);
+  assert.match(source, /DataProtectionScope\.CurrentUser/);
+  assert.match(source, /WriteGopeedTokenBridge\(gopeedPath, apiToken\)/);
+  assert.doesNotMatch(source, /POPO_GOPEED_API_TOKEN/);
+  assert.match(source, /apiToken = apiToken/);
   assert.match(source, /String\.Equals\(action, "verify_files"/);
   assert.match(source, /FileInfo/);
   assert.match(source, /sizeMatches/);
