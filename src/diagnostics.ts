@@ -57,7 +57,7 @@ export function redactText(value: unknown, maxLength = 160) {
   return String(value || "")
     .replace(/https?:\/\/[^\s"'<>]+/gi, "[url]")
     .replace(/\b[A-Za-z]:\\[^\r\n"'<>]*/g, "[path]")
-    .replace(/\b(?:token|cookie|authorization|password|secret|signature)\s*[:=]\s*[^\s,;]+/gi, "$1=[redacted]")
+    .replace(/\b(token|cookie|authorization|password|secret|signature)\s*[:=]\s*[^\s,;]+/gi, "$1=[redacted]")
     .replace(/\b[a-f0-9]{24,}\b/gi, "[id]")
     .replace(/[\u0000-\u001f\u007f]/g, " ")
     .replace(/\s+/g, " ")
@@ -75,6 +75,10 @@ export function sanitizeDiagnosticContext(value: unknown) {
   const output: Record<string, string | number | boolean> = {};
   for (const [key, raw] of Object.entries(value).slice(0, 16)) {
     if (!/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(key)) continue;
+    // Do not rely on the value containing a recognizable `token=...` label:
+    // internal callers may pass a credential as the bare value of a sensitive key.
+    const normalizedKey = key.toLowerCase().replace(/[_-]/g, "");
+    if (/(?:auth|cookie|token|credential|password|secret|signature|signedurl|downloadurl|apikey|accesskey|privatekey)/.test(normalizedKey)) continue;
     if (/^(?:job|task|batch|item|install).*id$/i.test(key)) {
       const hashed = anonymizeIdentifier(raw);
       if (hashed) output[key] = hashed;

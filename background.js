@@ -1530,8 +1530,7 @@ async function checkGopeedConnection(settings, stateToUpdate = null) {
       }
       effectiveSettings = mergeSettings({
         ...effectiveSettings,
-        gopeedEndpoint: normalizeGopeedEndpoint(nativeResult.endpoint),
-        gopeedToken: ""
+        gopeedEndpoint: normalizeGopeedEndpoint(nativeResult.endpoint)
       });
       await chrome.storage.local.set({ popoSettings: effectiveSettings });
       config = await getGopeedConfig(effectiveSettings, { timeoutMs: 5000 });
@@ -1539,6 +1538,8 @@ async function checkGopeedConnection(settings, stateToUpdate = null) {
       const nativeDetail = String(nativeError?.message || nativeError).replace(/^Error:\s*/, "");
       const detail = nativeError?.popoMaintenance
         ? nativeDetail
+        : nativeDetail.includes("Gopeed API Token 不正确")
+          ? "下载服务访问密钥不正确，请核对本机下载服务和扩展中的设置。"
         : `${firstError}；内置 Gopeed 启动失败：${nativeDetail}`;
       if (stateToUpdate) {
         stateToUpdate.settings = effectiveSettings;

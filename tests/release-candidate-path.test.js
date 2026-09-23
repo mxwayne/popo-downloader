@@ -53,9 +53,9 @@ test("candidate path preflight passes a short root and rejects the reproduced 12
     return;
   }
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "popo-candidate-path-"));
-  const payloadRoot = path.join(sandbox, "POPO-Stable-Downloader-0.7.8-win-x64");
+  const payloadRoot = path.join(sandbox, "popo-stable-downloader-0.7.8-win-x64");
   const deepest = path.join(payloadRoot, "Gopeed", "data", "flutter_assets", "packages", "cupertino_icons", "assets");
-  const zipPath = path.join(sandbox, "POPO-Stable-Downloader-0.7.8-win-x64.zip");
+  const zipPath = path.join(sandbox, "popo-stable-downloader-0.7.8-win-x64.zip");
   fs.mkdirSync(deepest, { recursive: true });
   fs.writeFileSync(path.join(deepest, "CupertinoIcons.ttf"), "fixture", "utf8");
   const psQuote = (value) => `'${value.replaceAll("'", "''")}'`;

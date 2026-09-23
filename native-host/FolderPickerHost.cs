@@ -1192,6 +1192,18 @@ internal static class FolderPickerHost
                     !String.IsNullOrWhiteSpace(Convert.ToString(downloadDirValue));
             }
         }
+        catch (WebException error)
+        {
+            HttpWebResponse response = error.Response as HttpWebResponse;
+            if (response == null) return false;
+            using (response)
+            {
+                // The listener was already tied to the bundled Gopeed process
+                // and a loopback-only port. An auth challenge proves its REST
+                // server is alive; the extension will retry with its token.
+                return response.StatusCode == HttpStatusCode.Unauthorized;
+            }
+        }
         catch
         {
             return false;

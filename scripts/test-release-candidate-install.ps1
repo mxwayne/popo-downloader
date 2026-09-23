@@ -16,7 +16,7 @@ $stableRoot = [System.IO.Path]::GetFullPath('D:\POPO\Stable\POPOStableDownloader
 $devRoot = [System.IO.Path]::GetFullPath('D:\POPO\Dev\POPODevDownloader').TrimEnd('\')
 $manifest = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'manifest.json')) | ConvertFrom-Json
 $version = [string]$manifest.version_name
-$packageName = "POPO-Stable-Downloader-$version-win-x64"
+$packageName = "popo-stable-downloader-$version-win-x64"
 if (-not $PackageZip) { $PackageZip = Join-Path $repoRoot "dist\$packageName.zip" }
 if (-not $PackageExe) { $PackageExe = Join-Path $repoRoot "dist\$packageName.exe" }
 $PackageZip = [System.IO.Path]::GetFullPath($PackageZip)
@@ -95,7 +95,7 @@ function Get-PathBudget([string]$ZipPath, [string]$InstallRoot) {
     $entryCount = 0
     foreach ($entry in $archive.Entries) {
       $archivePath = $entry.FullName.Replace('\', '/')
-      if (-not $archivePath.StartsWith($rootPrefix, [System.StringComparison]::Ordinal) -or
+      if (-not $archivePath.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or
           $archivePath.Length -le $rootPrefix.Length) {
         throw "ZIP entry is outside the official payload root: $archivePath"
       }

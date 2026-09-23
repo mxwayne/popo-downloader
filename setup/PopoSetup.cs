@@ -1150,7 +1150,13 @@ internal static class PopoSetup
             Path.Combine(packageRoot, "agent", "bin", "release-manifest.json")
         ))
         {
-            throw new InvalidDataException("The update agent component manifest does not match the package.");
+            throw new InvalidDataException(
+                "The update agent component manifest does not match the package: " +
+                DescribeFileMismatch(
+                    Path.Combine(packageRoot, "release-manifest.json"),
+                    Path.Combine(packageRoot, "agent", "bin", "release-manifest.json")
+                )
+            );
         }
     }
 
@@ -1917,7 +1923,10 @@ internal static class PopoSetup
 
         if (!DirectoriesMatch(sourceExtension, extensionRoot))
         {
-            throw new InvalidDataException("Candidate extension does not match its package source.");
+            throw new InvalidDataException(
+                "Candidate extension does not match its package source: " +
+                DescribeDirectoryMismatch(sourceExtension, extensionRoot)
+            );
         }
         if (!DirectoriesMatch(sourceGopeed, gopeedRoot))
         {
@@ -2002,6 +2011,56 @@ internal static class PopoSetup
     private static bool DirectoriesMatch(string leftRoot, string rightRoot)
     {
         return DirectoriesMatchExcluding(leftRoot, rightRoot, "");
+    }
+
+    private static string DescribeDirectoryMismatch(string expectedRoot, string actualRoot)
+    {
+        if (!Directory.Exists(expectedRoot)) return "package source directory is missing";
+        if (!Directory.Exists(actualRoot)) return "candidate directory is missing";
+        string[] expectedFiles = RelativeFiles(expectedRoot);
+        string[] actualFiles = RelativeFiles(actualRoot);
+        int commonCount = Math.Min(expectedFiles.Length, actualFiles.Length);
+        for (int index = 0; index < commonCount; index++)
+        {
+            if (!String.Equals(
+                expectedFiles[index],
+                actualFiles[index],
+                StringComparison.OrdinalIgnoreCase
+            ))
+            {
+                return "file list differs near " + expectedFiles[index] + " / " + actualFiles[index];
+            }
+            string expectedPath = Path.Combine(expectedRoot, expectedFiles[index]);
+            string actualPath = Path.Combine(actualRoot, actualFiles[index]);
+            if (!File.Exists(actualPath)) return "candidate file is missing: " + actualFiles[index];
+            if (new FileInfo(expectedPath).Length != new FileInfo(actualPath).Length)
+            {
+                return "file size differs: " + actualFiles[index];
+            }
+            if (!FilesMatch(expectedPath, actualPath))
+            {
+                return "file content differs: " + actualFiles[index];
+            }
+        }
+        if (expectedFiles.Length != actualFiles.Length)
+        {
+            return "file count differs: expected " + expectedFiles.Length +
+                ", found " + actualFiles.Length;
+        }
+        return "file list could not be compared";
+    }
+
+    private static string DescribeFileMismatch(string expectedPath, string actualPath)
+    {
+        if (!File.Exists(expectedPath)) return "package manifest is missing: " + expectedPath;
+        if (!File.Exists(actualPath)) return "agent manifest is missing: " + actualPath;
+        FileInfo expected = new FileInfo(expectedPath);
+        FileInfo actual = new FileInfo(actualPath);
+        if (expected.Length != actual.Length)
+        {
+            return "manifest byte lengths differ: " + expected.Length + " / " + actual.Length;
+        }
+        return "manifest content differs at " + actualPath;
     }
 
     private static bool DirectoriesMatchExcluding(

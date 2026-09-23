@@ -8,6 +8,7 @@ repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || {
 
 host=${POPO_WINDOWS_HOST:-edy-main}
 remote_root=${POPO_WINDOWS_REMOTE_ROOT:-/d/POPO/Validation/POPODevValidation}
+remote_bash=${POPO_WINDOWS_REMOTE_BASH:-bash}
 sync_extension=1
 build_dev_package=${POPO_WINDOWS_BUILD_DEV_PACKAGE:-0}
 install_dev_package=${POPO_WINDOWS_INSTALL_DEV_PACKAGE:-0}
@@ -61,7 +62,7 @@ print_summary() {
     echo "DEV SYNC BATCH: $dev_sync_batch"
   fi
   echo "DEV TARGET: $dev_target"
-  echo "STABLE TOUCHED: NO"
+  echo "STABLE OPERATION REQUESTED: NO"
   echo
   echo "NEXT:"
   if [[ $dev_sync == PASS ]]; then
@@ -107,7 +108,15 @@ if [[ $source_mode != auto && $source_mode != bundle ]]; then
   echo "POPO_WINDOWS_SOURCE_MODE must be auto or bundle." >&2
   exit 1
 fi
-if [[ ! $remote_root =~ ^/[A-Za-z]/([^/]+/)*POPODevValidation$ ]]; then
+if [[ ! $host =~ ^[A-Za-z0-9][A-Za-z0-9._@-]*$ ]]; then
+  echo "Refusing unsafe Windows SSH host: $host" >&2
+  exit 1
+fi
+if [[ $remote_bash != bash && ! $remote_bash =~ ^[A-Za-z]:\\([A-Za-z0-9._-]+\\)*bash\.exe$ ]]; then
+  echo "Refusing unsafe Windows remote Bash path: $remote_bash" >&2
+  exit 1
+fi
+if [[ ! $remote_root =~ ^/[A-Za-z]/([A-Za-z0-9_-]+/)*POPODevValidation$ ]]; then
   echo "Refusing unsafe Windows validation root: $remote_root" >&2
   echo "The path must be a drive-scoped directory named POPODevValidation." >&2
   exit 1
@@ -116,6 +125,19 @@ if [[ -n $(git -C "$repo_root" diff --name-only --diff-filter=U) ]]; then
   echo "Refusing to snapshot a working tree with unresolved conflicts." >&2
   exit 1
 fi
+
+remote_ssh() {
+  if [[ $remote_bash == bash ]]; then
+    ssh -o BatchMode=yes "$host" "$@"
+  else
+    local command_line="$*"
+    local powershell_command=${command_line//\'/\'\'}
+    local powershell_script="\$env:PATH = (Split-Path -LiteralPath '$remote_bash') + ';' + \$env:PATH; & '$remote_bash' -c '$powershell_command'"
+    local encoded_command
+    encoded_command=$(printf '%s' "$powershell_script" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\r\n')
+    ssh -o BatchMode=yes "$host" "powershell.exe -NoProfile -EncodedCommand $encoded_command"
+  fi
+}
 
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/popo-windows-validation.XXXXXX")
 remote_log="$scratch/windows-validation.log"
@@ -146,19 +168,20 @@ if [[ -s $untracked_list ]]; then
 else
   COPYFILE_DISABLE=1 tar --format ustar --no-xattrs -czf "$untracked_archive" --files-from /dev/null
 fi
-
-echo "Preparing isolated Windows validation snapshot: $token"
-ssh -o BatchMode=yes "$host" \
-  "mkdir -p '$remote_root/incoming' && test ! -e '$remote_root/incoming/$token.working-tree.patch'"
-ssh -o BatchMode=yes "$host" \
-  "cat > '$remote_root/incoming/$token.working-tree.patch'" <"$patch"
-ssh -o BatchMode=yes "$host" \
-  "cat > '$remote_root/incoming/$token.untracked-files.tar.gz'" <"$untracked_archive"
+patch_sha256=$(shasum -a 256 "$patch" | awk '{print $1}')
+untracked_sha256=$(shasum -a 256 "$untracked_archive" | awk '{print $1}')
+bundle_sha256=none
 if [[ $source_kind == bundle ]]; then
-  ssh -o BatchMode=yes "$host" \
-    "cat > '$remote_root/incoming/$token.source.bundle'" <"$bundle"
+  bundle_sha256=$(shasum -a 256 "$bundle" | awk '{print $1}')
 fi
 
-ssh -o BatchMode=yes "$host" \
-  bash -s -- "$remote_root" "$token" "$base_commit" "$sync_extension" "$source_kind" "$origin_url" "$build_dev_package" "$install_dev_package" \
+echo "Preparing isolated Windows validation snapshot: $token"
+remote_ssh "mkdir -p '$remote_root/incoming' && test ! -e '$remote_root/incoming/$token.working-tree.patch'"
+remote_ssh "cat > '$remote_root/incoming/$token.working-tree.patch'" <"$patch"
+remote_ssh "cat > '$remote_root/incoming/$token.untracked-files.tar.gz'" <"$untracked_archive"
+if [[ $source_kind == bundle ]]; then
+  remote_ssh "cat > '$remote_root/incoming/$token.source.bundle'" <"$bundle"
+fi
+
+remote_ssh bash -s -- "$remote_root" "$token" "$base_commit" "$sync_extension" "$source_kind" "$origin_url" "$build_dev_package" "$install_dev_package" "$patch_sha256" "$untracked_sha256" "$bundle_sha256" \
   <"$repo_root/scripts/windows-remote-runner.sh" | tee "$remote_log"

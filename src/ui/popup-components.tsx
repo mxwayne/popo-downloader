@@ -459,6 +459,8 @@ export function ServiceSettings({
 }) {
   const { send: callExtension, currentPopoTabId, copyText } = useUiActions();
   const [busy, setBusy] = useState(false);
+  const [gopeedToken, setGopeedToken] = useState(String(settings.gopeedToken || ""));
+  useEffect(() => setGopeedToken(String(settings.gopeedToken || "")), [settings.gopeedToken]);
   const selectedPath = String(settings.gopeedDownloadDirOverride || "").trim();
   const concurrency = Math.min(
     5,
@@ -501,6 +503,24 @@ export function ServiceSettings({
         gopeedEndpoint: settings.gopeedEndpoint || "http://127.0.0.1:9999",
         gopeedToken: settings.gopeedToken || "",
         gopeedDownloadDirOverride: "",
+      });
+      setSettings(response.settings || {});
+      setConnection(response.connection);
+    } catch (error) {
+      showError(error);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveGopeedToken = async () => {
+    setBusy(true);
+    try {
+      const response = await callExtension<GopeedResponse>({
+        type: "SAVE_GOPEED_SETTINGS",
+        gopeedEndpoint: settings.gopeedEndpoint || "http://127.0.0.1:9999",
+        gopeedToken,
+        gopeedDownloadDirOverride: settings.gopeedDownloadDirOverride || "",
       });
       setSettings(response.settings || {});
       setConnection(response.connection);
@@ -565,6 +585,22 @@ export function ServiceSettings({
                 ? "运行正常。"
                 : "正在恢复，请稍后再试。"}
           </p>
+          <div className="gopeed-token-setting">
+            <label htmlFor="gopeedApiToken">下载服务访问密钥</label>
+            <input
+              id="gopeedApiToken"
+              type="password"
+              autoComplete="new-password"
+              value={gopeedToken}
+              maxLength={4096}
+              disabled={busy}
+              onChange={(event) => setGopeedToken(event.target.value)}
+            />
+            <p>先在下载服务设置中启用同一密钥，再保存到扩展。</p>
+            <button type="button" disabled={busy} onClick={() => void saveGopeedToken()}>
+              保存密钥
+            </button>
+          </div>
           <div className="concurrency-setting">
             <label htmlFor="downloadConcurrency">并行下载数</label>
             <select

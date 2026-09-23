@@ -86,7 +86,14 @@ test("诊断事件只保留脱敏状态、数量和匿名标识", () => {
         taskId: "task-secret-456",
         failureStage: "访问 https://secret.example/file?token=abc",
         path: "C:\\Users\\Alice\\Private\\movie.mp4",
-        token: "token=super-secret"
+        token: "token=super-secret",
+        authorization: "raw-authorization-secret",
+        apiToken: "raw-api-token-secret",
+        signedUrl: "https://storage.example/download?signature=raw-signature",
+        cookie: "session=raw-cookie-secret",
+        signed_url: "https://storage.example/file?X-Amz-Signature=raw-underscore-signature",
+        download_url: "https://storage.example/file?token=raw-download-token",
+        api_key: "raw-api-key-secret"
       }
     },
     installId: "install-user-machine",
@@ -102,6 +109,14 @@ test("诊断事件只保留脱敏状态、数量和匿名标识", () => {
   assert.equal(event.tags.install.startsWith("h:"), true);
   assert.equal(event.extra.counts.total, 12);
   assert.doesNotMatch(exported, /secret\.example|super-secret|Alice|movie\.mp4/);
+  assert.doesNotMatch(exported, /raw-authorization-secret|raw-api-token-secret|raw-signature|raw-cookie-secret|raw-underscore-signature|raw-download-token|raw-api-key-secret|storage\.example/);
+  assert.equal(Object.hasOwn(event.extra.context, "authorization"), false);
+  assert.equal(Object.hasOwn(event.extra.context, "apiToken"), false);
+  assert.equal(Object.hasOwn(event.extra.context, "signedUrl"), false);
+  assert.equal(Object.hasOwn(event.extra.context, "cookie"), false);
+  assert.equal(Object.hasOwn(event.extra.context, "signed_url"), false);
+  assert.equal(Object.hasOwn(event.extra.context, "download_url"), false);
+  assert.equal(Object.hasOwn(event.extra.context, "api_key"), false);
   assert.match(exported, /\[url\]|\[path\]/);
 });
 

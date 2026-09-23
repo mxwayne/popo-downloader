@@ -40,6 +40,8 @@ test("本机助手以 Native Messaging 提供受限的系统操作", () => {
   assert.match(source, /--apply-update/);
   assert.match(source, /Process\.Start/);
   assert.match(source, /FindListeningPorts/);
+  assert.match(source, /error\.Response as HttpWebResponse/);
+  assert.match(source, /response\.StatusCode == HttpStatusCode\.Unauthorized/);
   assert.match(source, /\/api\/v1\/config/);
   assert.match(source, /Console\.OpenStandardInput/);
   assert.match(source, /BitConverter\.ToInt32/);

@@ -118,6 +118,7 @@ test("固定端口不可用时自动启动内置 Gopeed 并保存发现的端口
   delete require.cache[backgroundPath];
   const stored = {};
   const requestedEndpoints = [];
+  const requestedTokens = [];
   let nativeRequest = null;
   const actualGopeed = require("../gopeed.js");
 
@@ -129,6 +130,7 @@ test("固定端口不可用时自动启动内置 Gopeed 并保存发现的端口
         ...actualGopeed,
         async getConfig(settings) {
           requestedEndpoints.push(settings.gopeedEndpoint);
+          requestedTokens.push(settings.gopeedToken);
           if (settings.gopeedEndpoint === "http://127.0.0.1:32123") {
             return { downloadDir: "D:\\Downloads", maxRunning: 5 };
           }
@@ -164,6 +166,7 @@ test("固定端口不可用时自动启动内置 Gopeed 并保存发现的端口
     },
     tabs: { onRemoved: eventStub(), onUpdated: eventStub() }
   };
+  stored.popoSettings = { gopeedToken: "dev-test-token" };
 
   require(backgroundPath);
   const listener = global.chrome.runtime.onMessage.listeners[0];
@@ -176,6 +179,8 @@ test("固定端口不可用时自动启动内置 Gopeed 并保存发现的端口
   assert.equal(response.connection.endpoint, "http://127.0.0.1:32123");
   assert.deepEqual(nativeRequest, { action: "ensure_gopeed" });
   assert.deepEqual(requestedEndpoints, ["http://127.0.0.1:9999", "http://127.0.0.1:32123"]);
+  assert.deepEqual(requestedTokens, ["dev-test-token", "dev-test-token"]);
+  assert.equal(stored.popoSettings.gopeedToken, "dev-test-token");
   assert.equal(stored.popoSettings.gopeedEndpoint, "http://127.0.0.1:32123");
   assert.equal(stored.popoState, undefined);
 

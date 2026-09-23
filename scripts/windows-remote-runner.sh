@@ -9,8 +9,11 @@ source_kind=${5:-}
 origin_url=${6:-}
 build_dev_package=${7:-0}
 install_dev_package=${8:-0}
+patch_sha256=${9:-}
+untracked_sha256=${10:-}
+bundle_sha256=${11:-none}
 
-if [[ ! $remote_root =~ ^/[A-Za-z]/([^/]+/)*POPODevValidation$ ]]; then
+if [[ ! $remote_root =~ ^/[A-Za-z]/([A-Za-z0-9_-]+/)*POPODevValidation$ ]]; then
   echo "Refusing unsafe Windows validation root: $remote_root" >&2
   exit 1
 fi
@@ -46,6 +49,16 @@ if [[ $install_dev_package == 1 && $build_dev_package != 1 ]]; then
   echo "Refusing Dev install without a Dev package build." >&2
   exit 1
 fi
+for digest in "$patch_sha256" "$untracked_sha256"; do
+  if [[ ! $digest =~ ^[0-9a-f]{64}$ ]]; then
+    echo "Refusing invalid validation input digest." >&2
+    exit 1
+  fi
+done
+if [[ $source_kind == bundle && ! $bundle_sha256 =~ ^[0-9a-f]{64}$ ]]; then
+  echo "Refusing invalid Git bundle digest." >&2
+  exit 1
+fi
 
 incoming="$remote_root/incoming"
 bundle="$incoming/$token.source.bundle"
@@ -64,6 +77,19 @@ for required in "${required_inputs[@]}"; do
     exit 1
   fi
 done
+verify_sha256() {
+  local path=$1 expected=$2 actual
+  actual=$(node -e 'process.stdout.write(require("node:crypto").createHash("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("hex"))' "$path")
+  if [[ $actual != "$expected" ]]; then
+    echo "Validation input digest mismatch: $(basename "$path")" >&2
+    exit 1
+  fi
+}
+verify_sha256 "$patch" "$patch_sha256"
+verify_sha256 "$untracked_archive" "$untracked_sha256"
+if [[ $source_kind == bundle ]]; then
+  verify_sha256 "$bundle" "$bundle_sha256"
+fi
 if [[ -e $run_root ]]; then
   echo "Refusing to replace an existing validation run: $run_root" >&2
   exit 1
@@ -79,7 +105,44 @@ git -C "$source_root" checkout --quiet --detach "$base_commit"
 if [[ -s $patch ]]; then
   git -C "$source_root" apply --whitespace=nowarn "$patch"
 fi
-tar -xzf "$untracked_archive" -C "$source_root"
+
+# Extract untracked inputs into an empty staging directory first. Never allow
+# the archive to replace tracked or pre-existing checkout files that will run.
+untracked_root="$run_root/untracked"
+mkdir -p "$untracked_root"
+tar --no-same-owner --no-same-permissions --keep-old-files -xzf "$untracked_archive" -C "$untracked_root"
+if find "$untracked_root" -type l -print -quit | grep -q .; then
+  echo "Refusing symbolic links in the untracked input archive." >&2
+  exit 1
+fi
+while IFS= read -r -d '' staged_file; do
+  relative=${staged_file#"$untracked_root"/}
+  if [[ -z $relative || $relative == /* || $relative == *\\* || "/$relative/" == *"/../"* || "/$relative/" == *"/.git/"* ]]; then
+    echo "Refusing unsafe untracked archive path: $relative" >&2
+    exit 1
+  fi
+  if git -C "$source_root" ls-files --error-unmatch -- "$relative" >/dev/null 2>&1; then
+    echo "Refusing archive entry that collides with a tracked source file: $relative" >&2
+    exit 1
+  fi
+  destination="$source_root/$relative"
+  ancestor="$source_root"
+  IFS='/' read -r -a segments <<< "$relative"
+  for segment in "${segments[@]:0:${#segments[@]}-1}"; do
+    ancestor="$ancestor/$segment"
+    if [[ -L $ancestor ]]; then
+      echo "Refusing archive entry beneath a symbolic link: $relative" >&2
+      exit 1
+    fi
+  done
+  if [[ -e $destination || -L $destination ]]; then
+    echo "Refusing archive entry that replaces an existing checkout path: $relative" >&2
+    exit 1
+  fi
+  mkdir -p "$(dirname "$destination")"
+  cp -- "$staged_file" "$destination"
+done < <(find "$untracked_root" -type f -print0)
+rm -rf "$untracked_root"
 
 repo_windows=$(cygpath -w "$source_root")
 validator_windows=$(cygpath -w "$source_root/scripts/windows-dev-validate.ps1")

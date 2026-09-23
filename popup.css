@@ -603,6 +603,30 @@ h2 {
   line-height: 1.45;
 }
 
+.gopeed-token-setting {
+  display: grid;
+  gap: 5px;
+  margin-top: 9px;
+  color: var(--field-copy);
+  font-size: 10px;
+}
+
+#gopeedApiToken {
+  width: 100%;
+  min-height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--control-line);
+  border-radius: 7px;
+  color: var(--ink);
+  background: var(--surface-input);
+}
+
+.gopeed-token-setting p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
 details { margin-top: 7px; }
 summary {
   color: var(--summary-copy);

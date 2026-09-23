@@ -119,7 +119,7 @@ body{font-family:system-ui,"Microsoft YaHei",sans-serif;margin:0;background:#0b1
 const token=${JSON.stringify(token)};const plan=${serializedPlan};const rows=document.querySelector('#rows');const run=document.querySelector('#run');const summary=document.querySelector('#summary');
 function render(states={}){rows.innerHTML=plan.map(x=>{const s=states[x.id]||{};const cls=s.fileExists?'ok':s.status==='failed'?'bad':'pending';const label=s.fileExists?'文件已落盘':(s.status||'等待');return '<tr><td><code>'+escapeHtml(x.sourceName)+'</code></td><td><code>'+escapeHtml(x.relativeFilename)+'</code></td><td class="'+cls+'">'+escapeHtml(label)+'</td></tr>'}).join('')}
 function escapeHtml(v){return String(v).replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]))}
-async function status(){const r=await fetch('/api/status',{cache:'no-store'});const data=await r.json();const map=Object.fromEntries((data.items||[]).map(x=>[x.id,x]));render(map);const done=(data.items||[]).filter(x=>x.fileExists).length;summary.textContent=done+'/'+plan.length+' 个文件已落盘';summary.className=done===plan.length?'ok':'pending';if(done<plan.length)setTimeout(status,1500)}
+async function status(){const r=await fetch('/api/status',{cache:'no-store',headers:{'X-Smoke-Token':token}});if(!r.ok)throw new Error('验收状态读取失败');const data=await r.json();const map=Object.fromEntries((data.items||[]).map(x=>[x.id,x]));render(map);const done=(data.items||[]).filter(x=>x.fileExists).length;summary.textContent=done+'/'+plan.length+' 个文件已落盘';summary.className=done===plan.length?'ok':'pending';if(done<plan.length)setTimeout(status,1500)}
 run.addEventListener('click',async()=>{run.disabled=true;summary.textContent='正在创建 Gopeed 任务…';try{const r=await fetch('/api/run',{method:'POST',headers:{'X-Smoke-Token':token}});const data=await r.json();if(!r.ok)throw new Error(data.error||'启动失败');await status()}catch(e){summary.textContent=e.message;summary.className='bad';run.disabled=false}});render();status().catch(()=>{});
 </script></main></body></html>`;
 }
@@ -143,6 +143,9 @@ async function taskStates(plan, gopeedSettings) {
 
 export async function startFilenameSmokeServer(options = {}) {
   const host = options.host || DEFAULT_HOST;
+  if (!new Set(["127.0.0.1", "localhost", "::1", "[::1]"]).has(host)) {
+    throw new Error("文件名验收站只能监听本机回环地址");
+  }
   const port = Number(options.port ?? DEFAULT_PORT);
   const downloadDir = normalizeDownloadDirectory(options.downloadDir || process.env.POPO_FILENAME_SMOKE_ROOT || DEFAULT_DOWNLOAD_DIR);
   const gopeedSettings = {
@@ -155,6 +158,10 @@ export async function startFilenameSmokeServer(options = {}) {
 
   const server = createServer(async (request, response) => {
     try {
+      const expectedHost = origin ? new URL(origin).host.toLowerCase() : "";
+      if (!expectedHost || String(request.headers.host || "").toLowerCase() !== expectedHost) {
+        return json(response, 421, { error: "验收站仅接受固定本机地址" });
+      }
       const url = new URL(request.url || "/", origin || `http://${host}:${port || DEFAULT_PORT}`);
       if (request.method === "GET" && url.pathname === "/") {
         const body = Buffer.from(htmlPage(token, plan, downloadDir));
@@ -175,9 +182,15 @@ export async function startFilenameSmokeServer(options = {}) {
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/status") {
+        if (request.headers["x-smoke-token"] !== token) {
+          return json(response, 403, { error: "验收令牌无效" });
+        }
         return json(response, 200, { items: await taskStates(plan, gopeedSettings) });
       }
       if (request.method === "POST" && url.pathname === "/api/run") {
+        if (request.headers.origin !== origin) {
+          return json(response, 403, { error: "验收请求来源无效" });
+        }
         if (request.headers["x-smoke-token"] !== token) return json(response, 403, { error: "验收令牌无效" });
         await getConfig(gopeedSettings, { timeoutMs: 5000 });
         const existingTasks = await listTasks(gopeedSettings, { timeoutMs: 5000 });
@@ -210,7 +223,8 @@ export async function startFilenameSmokeServer(options = {}) {
     server.listen(port, host, resolve);
   });
   const address = server.address();
-  origin = `http://${host}:${address.port}`;
+  const originHost = host === "::1" ? "[::1]" : host;
+  origin = `http://${originHost}:${address.port}`;
   return { server, origin, downloadDir, plan: publicPlan(plan) };
 }
 

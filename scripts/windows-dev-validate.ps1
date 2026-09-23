@@ -45,58 +45,103 @@ try {
   }
 
   if ($InstallDevPackage) {
-    $projectManifest = Get-Content -LiteralPath (Join-Path $repo 'manifest.json') -Raw |
-      ConvertFrom-Json
+    # Windows PowerShell 5.1 treats UTF-8 without a BOM as the active ANSI
+    # code page, which corrupts the localized manifest before JSON parsing.
+    $projectManifestText = [System.IO.File]::ReadAllText(
+      (Join-Path $repo 'manifest.json'), [System.Text.Encoding]::UTF8
+    )
+    $projectManifest = $projectManifestText | ConvertFrom-Json
     $devVersionName = "$([string]$projectManifest.version)-dev"
-    $packageRoot = Join-Path $repo "dist\POPO-Dev-Downloader-$devVersionName-win-x64"
-    $setupPath = Join-Path $packageRoot 'POPO-Dev-Setup.exe'
-    $sourceNativeHost = Join-Path $packageRoot 'native-host\bin\PopoFolderPickerHost.exe'
-    $devRoot = 'D:\POPO\Dev\POPODevDownloader'
-    if (-not (Test-Path -LiteralPath $setupPath -PathType Leaf)) {
-      throw "Dev setup executable was not found: $setupPath"
+    $packageName = "popo-dev-downloader-$devVersionName-win-x64"
+    $packageZip = Join-Path $repo "dist\$packageName.zip"
+    $packageExtractRoot = Join-Path ([System.IO.Path]::GetTempPath()) `
+      ("POPO-Dev-Install-" + [Guid]::NewGuid().ToString('N'))
+    if (-not (Test-Path -LiteralPath $packageZip -PathType Leaf)) {
+      throw "Built Dev package ZIP was not found: $packageZip"
     }
-    if (-not (Test-Path -LiteralPath $sourceNativeHost -PathType Leaf)) {
-      throw "Built Dev native host was not found: $sourceNativeHost"
+    New-Item -ItemType Directory -Path $packageExtractRoot -Force | Out-Null
+    try {
+      Expand-Archive -LiteralPath $packageZip -DestinationPath $packageExtractRoot -Force
+      $packageRoot = Join-Path $packageExtractRoot $packageName
+      $setupPath = Join-Path $packageRoot 'popo-dev-setup.exe'
+      $sourceNativeHost = Join-Path $packageRoot 'native-host\bin\PopoFolderPickerHost.exe'
+      $devRoot = 'D:\POPO\Dev\POPODevDownloader'
+      if (-not (Test-Path -LiteralPath $setupPath -PathType Leaf)) {
+        throw "Dev setup executable was not found: $setupPath"
+      }
+      if (-not (Test-Path -LiteralPath $sourceNativeHost -PathType Leaf)) {
+        throw "Built Dev native host was not found: $sourceNativeHost"
+      }
+
+      $setupStartInfo = New-Object System.Diagnostics.ProcessStartInfo
+      $setupStartInfo.FileName = $setupPath
+      $setupStartInfo.Arguments = '--quiet --install-root "' + $devRoot + '" --repair'
+      $setupStartInfo.WorkingDirectory = $packageRoot
+      $setupStartInfo.UseShellExecute = $false
+      $setupProcess = [System.Diagnostics.Process]::Start($setupStartInfo)
+      if ($null -eq $setupProcess) { throw 'Dev package installer did not start.' }
+      try {
+        $setupProcess.WaitForExit()
+        if ($setupProcess.ExitCode -ne 0) {
+          throw "Dev package installation failed with exit code $($setupProcess.ExitCode)."
+        }
+      }
+      finally {
+        $setupProcess.Dispose()
+      }
+
+      $installedNativeRoot = Join-Path $devRoot 'NativeHost'
+      $installedNativeHost = Join-Path $installedNativeRoot 'PopoFolderPickerHost.exe'
+      $nativeManifestPath = Join-Path $installedNativeRoot 'com.popo.dev_downloader.folder_picker.json'
+      $installStatePath = Join-Path $devRoot 'install-state.json'
+      foreach ($required in @($installedNativeHost, $nativeManifestPath, $installStatePath)) {
+        if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+          throw "Installed Dev component was not found: $required"
+        }
+      }
+      if ((Get-FileHash -LiteralPath $installedNativeHost -Algorithm SHA256).Hash -ne
+          (Get-FileHash -LiteralPath $sourceNativeHost -Algorithm SHA256).Hash) {
+        throw 'Installed Dev native host does not match the verified package.'
+      }
+
+      $nativeManifest = Get-Content -LiteralPath $nativeManifestPath -Raw | ConvertFrom-Json
+      if ([string]$nativeManifest.name -ne 'com.popo.dev_downloader.folder_picker' -or
+          [System.IO.Path]::GetFullPath([string]$nativeManifest.path) -ine
+            [System.IO.Path]::GetFullPath($installedNativeHost) -or
+          @($nativeManifest.allowed_origins) -notcontains
+            'chrome-extension://folfhehnopknchpoaajfpboibbhnlanf/') {
+        throw 'Installed Dev native messaging manifest identity is invalid.'
+      }
+      $registryKey = Get-Item -LiteralPath `
+        'HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.popo.dev_downloader.folder_picker'
+      $registeredManifest = [string]$registryKey.GetValue('')
+      if ([System.IO.Path]::GetFullPath($registeredManifest) -ine
+          [System.IO.Path]::GetFullPath($nativeManifestPath)) {
+        throw 'Chrome Dev native messaging registration does not point to the installed manifest.'
+      }
+      $installState = Get-Content -LiteralPath $installStatePath -Raw | ConvertFrom-Json
+      if ([string]$installState.extensionId -ne 'folfhehnopknchpoaajfpboibbhnlanf' -or
+          [string]$installState.version -ne $devVersionName) {
+        throw 'Installed Dev state has the wrong extension identity or version.'
+      }
+      Write-Output 'POPO_DEV_INSTALL=PASS'
     }
-
-    & $setupPath --quiet --install-root $devRoot --repair
-    if ($LASTEXITCODE -ne 0) { throw "Dev package installation failed with exit code $LASTEXITCODE." }
-
-    $installedNativeRoot = Join-Path $devRoot 'NativeHost'
-    $installedNativeHost = Join-Path $installedNativeRoot 'PopoFolderPickerHost.exe'
-    $nativeManifestPath = Join-Path $installedNativeRoot 'com.popo.dev_downloader.folder_picker.json'
-    $installStatePath = Join-Path $devRoot 'install-state.json'
-    foreach ($required in @($installedNativeHost, $nativeManifestPath, $installStatePath)) {
-      if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
-        throw "Installed Dev component was not found: $required"
+    finally {
+      for ($cleanupAttempt = 0; $cleanupAttempt -lt 4; $cleanupAttempt++) {
+        if (-not (Test-Path -LiteralPath $packageExtractRoot)) { break }
+        try {
+          Remove-Item -LiteralPath $packageExtractRoot -Recurse -Force -ErrorAction Stop
+        }
+        catch {
+          if ($cleanupAttempt -eq 3) {
+            Write-Warning "Could not remove temporary Dev package extraction: $packageExtractRoot"
+          }
+          else {
+            Start-Sleep -Milliseconds (200 * ($cleanupAttempt + 1))
+          }
+        }
       }
     }
-    if ((Get-FileHash -LiteralPath $installedNativeHost -Algorithm SHA256).Hash -ne
-        (Get-FileHash -LiteralPath $sourceNativeHost -Algorithm SHA256).Hash) {
-      throw 'Installed Dev native host does not match the verified package.'
-    }
-
-    $nativeManifest = Get-Content -LiteralPath $nativeManifestPath -Raw | ConvertFrom-Json
-    if ([string]$nativeManifest.name -ne 'com.popo.dev_downloader.folder_picker' -or
-        [System.IO.Path]::GetFullPath([string]$nativeManifest.path) -ine
-          [System.IO.Path]::GetFullPath($installedNativeHost) -or
-        @($nativeManifest.allowed_origins) -notcontains
-          'chrome-extension://folfhehnopknchpoaajfpboibbhnlanf/') {
-      throw 'Installed Dev native messaging manifest identity is invalid.'
-    }
-    $registryKey = Get-Item -LiteralPath `
-      'HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.popo.dev_downloader.folder_picker'
-    $registeredManifest = [string]$registryKey.GetValue('')
-    if ([System.IO.Path]::GetFullPath($registeredManifest) -ine
-        [System.IO.Path]::GetFullPath($nativeManifestPath)) {
-      throw 'Chrome Dev native messaging registration does not point to the installed manifest.'
-    }
-    $installState = Get-Content -LiteralPath $installStatePath -Raw | ConvertFrom-Json
-    if ([string]$installState.extensionId -ne 'folfhehnopknchpoaajfpboibbhnlanf' -or
-        [string]$installState.versionName -ne $devVersionName) {
-      throw 'Installed Dev state has the wrong extension identity or version.'
-    }
-    Write-Output 'POPO_DEV_INSTALL=PASS'
   }
 
   $syncResult = $null

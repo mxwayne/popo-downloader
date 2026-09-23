@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const http = require("node:http");
 const test = require("node:test");
 
 async function loadSmokeModule() {
@@ -26,6 +27,14 @@ test("STEP 2 验收站复用产品算法生成保留名与稳定碰撞路径", a
   assert.equal(new Set(plan.filter((item) => item.name.endsWith(".mp4")).map((item) => item.sha256)).size, 4);
 });
 
+test("STEP 2 验收站拒绝监听非回环地址", async () => {
+  const { startFilenameSmokeServer } = await loadSmokeModule();
+  await assert.rejects(
+    startFilenameSmokeServer({ host: "0.0.0.0", port: 0 }),
+    /只能监听本机回环地址/
+  );
+});
+
 test("STEP 2 验收站只监听本机并提供预置文件，不需要人工上传", async (t) => {
   const { startFilenameSmokeServer } = await loadSmokeModule();
   const smoke = await startFilenameSmokeServer({ port: 0 });
@@ -34,7 +43,39 @@ test("STEP 2 验收站只监听本机并提供预置文件，不需要人工上�
   assert.match(smoke.origin, /^http:\/\/127\.0\.0\.1:\d+$/);
   const page = await fetch(smoke.origin);
   assert.equal(page.status, 200);
-  assert.match(await page.text(), /POPO STEP 2 文件名验收站/);
+  const html = await page.text();
+  assert.match(html, /POPO STEP 2 文件名验收站/);
+  const token = html.match(/const token="([a-f0-9]+)"/)?.[1];
+  assert.ok(token);
+
+  const unauthenticatedStatus = await fetch(`${smoke.origin}/api/status`);
+  assert.equal(unauthenticatedStatus.status, 403);
+  const authenticatedStatus = await fetch(`${smoke.origin}/api/status`, {
+    headers: { "X-Smoke-Token": token }
+  });
+  assert.equal(authenticatedStatus.status, 200);
+
+  const missingOrigin = await fetch(`${smoke.origin}/api/run`, {
+    method: "POST",
+    headers: { "X-Smoke-Token": token }
+  });
+  assert.equal(missingOrigin.status, 403);
+
+  const spoofedHost = await new Promise((resolve, reject) => {
+    const target = new URL(smoke.origin);
+    const request = http.request({
+      host: target.hostname,
+      port: Number(target.port),
+      path: "/api/status",
+      headers: { Host: `attacker.example:${target.port}` }
+    }, (response) => {
+      response.resume();
+      response.on("end", () => resolve(response.statusCode));
+    });
+    request.on("error", reject);
+    request.end();
+  });
+  assert.equal(spoofedHost, 421);
 
   const fixture = await fetch(`${smoke.origin}/files/collision-colon`);
   assert.equal(fixture.status, 200);
