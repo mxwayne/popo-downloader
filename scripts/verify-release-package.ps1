@@ -2,6 +2,7 @@
 param(
   [string]$RepoRoot = '',
   [string]$ManifestPath = '',
+  [string]$GitHubManifestPath = '',
   [string]$PackagePath = '',
   [string]$BootstrapperPath = ''
 )
@@ -31,6 +32,17 @@ if (-not ([string]$manifest.artifact).EndsWith('.zip', [System.StringComparison]
 if (-not ([string]$manifest.url).EndsWith('/' + [string]$manifest.artifact, [System.StringComparison]::Ordinal)) {
   throw 'latest.json URL must reference the official ZIP artifact.'
 }
+if (-not $GitHubManifestPath) {
+  $GitHubManifestPath = Join-Path (Split-Path -Parent $manifestPath) 'latest.github.json'
+}
+$githubManifestPath = (Resolve-Path -LiteralPath $GitHubManifestPath).Path
+$githubManifestJson = [System.IO.File]::ReadAllText($githubManifestPath)
+$githubManifest = $githubManifestJson | ConvertFrom-Json
+$githubPublishedAtMatch = [regex]::Match($githubManifestJson, '"publishedAt"\s*:\s*"([^"\\]+)"')
+if (-not $githubPublishedAtMatch.Success) {
+  throw 'latest.github.json publishedAt must be a non-empty JSON string.'
+}
+$githubPublishedAt = $githubPublishedAtMatch.Groups[1].Value
 if (-not $PackagePath) {
   $PackagePath = Join-Path (Split-Path -Parent $manifestPath) ([string]$manifest.artifact)
 }
@@ -133,6 +145,46 @@ finally {
   $rsa.Dispose()
 }
 if (-not $signatureValid) { throw 'latest.json release signature is invalid.' }
+
+# GitHub backup manifest: it must describe the same release as latest.json (same version, ZIP,
+# SHA-256, size and publish time). Only the download URL differs, it must be signed separately with
+# the same key, and the URL must be a Release asset that clients are allowed to use.
+foreach ($field in @('schemaVersion', 'channel', 'version', 'chromeVersion', 'artifact', 'sha256', 'size')) {
+  if ([string]$githubManifest.$field -ne [string]$manifest.$field) {
+    throw "latest.github.json field '$field' does not match latest.json."
+  }
+}
+if ($githubPublishedAt -ne $manifestPublishedAt) {
+  throw 'latest.github.json publishedAt does not match latest.json.'
+}
+$expectedGitHubUrl = "https://github.com/mxwayne/popo-downloader/releases/download/v$($manifest.version)/$($manifest.artifact)"
+if ([string]$githubManifest.url -ne $expectedGitHubUrl) {
+  throw "latest.github.json URL must be $expectedGitHubUrl."
+}
+$githubCanonical = @(
+  [string]$githubManifest.schemaVersion,
+  [string]$githubManifest.channel,
+  [string]$githubManifest.version,
+  [string]$githubManifest.chromeVersion,
+  $githubPublishedAt,
+  [string]$githubManifest.artifact,
+  [string]$githubManifest.url,
+  [string]$githubManifest.sha256,
+  [string]$githubManifest.size
+) -join "`n"
+$githubRsa = New-Object System.Security.Cryptography.RSACryptoServiceProvider
+try {
+  $githubRsa.FromXmlString($publicXml)
+  $githubSignatureValid = $githubRsa.VerifyData(
+    [System.Text.Encoding]::UTF8.GetBytes($githubCanonical),
+    [System.Security.Cryptography.CryptoConfig]::MapNameToOID('SHA256'),
+    [Convert]::FromBase64String([string]$githubManifest.signature)
+  )
+}
+finally {
+  $githubRsa.Dispose()
+}
+if (-not $githubSignatureValid) { throw 'latest.github.json release signature is invalid.' }
 
 $expectedRoot = "POPO-Stable-Downloader-$($manifest.version)-win-x64/"
 $requiredEntries = @(

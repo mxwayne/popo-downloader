@@ -883,3 +883,53 @@ export function jobTimingLabel(job: QueueJob, now = Date.now()): string {
   }
   return `${scanPart} · 下载已用 ${formatDuration(now - scanned)}`;
 }
+
+export const GITHUB_RELEASES_URL = "https://github.com/mxwayne/popo-downloader/releases/latest";
+
+export interface UpdateFailureGuidance {
+  title: string;
+  hint: string;
+  /** 后台给出的原始原因（英文技术文案），供用户复制给维护者。 */
+  detail: string;
+}
+
+/** 自动更新失败时给出能照着做的提示；其他状态返回 null。 */
+export function updateFailureGuidance(
+  status: { state: string; message?: string } | null | undefined,
+): UpdateFailureGuidance | null {
+  if (!status || status.state !== "failed") return null;
+  const detail = String(status.message || "").trim();
+  if (/setup process|exit code|installer/i.test(detail)) {
+    return {
+      title: "自动更新失败：安装程序没有完成",
+      hint: "最常见的原因是 Gopeed 仍在运行并占用文件。请先退出 Gopeed（右下角托盘图标里也要退出），再重新打开本弹窗重试。",
+      detail,
+    };
+  }
+  if (/signature|sha-?256|metadata|checksum/i.test(detail)) {
+    return {
+      title: "自动更新失败：更新包校验没有通过",
+      hint: "为了安全已拒绝安装，当前版本不受影响。请稍后重试；如果一直出现，请联系维护者。",
+      detail,
+    };
+  }
+  if (/native messaging|native host|host not found|forbidden/i.test(detail)) {
+    return {
+      title: "自动更新失败：本机助手不可用",
+      hint: "请确认已用安装包安装本机助手（不是只加载了扩展目录），然后重新打开本弹窗重试。",
+      detail,
+    };
+  }
+  if (/remote name|resolve|timed out|timeout|connect|network|unable to|http|service/i.test(detail)) {
+    return {
+      title: "自动更新失败：无法连接更新服务",
+      hint: "请检查网络；如果访问不了更新服务器，可以开启代理后重试。",
+      detail,
+    };
+  }
+  return {
+    title: "自动更新失败",
+    hint: "请稍后重新打开本弹窗重试。",
+    detail,
+  };
+}

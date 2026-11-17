@@ -70,7 +70,7 @@ test("开发绿色版与正式版使用独立安装身份", () => {
   assert.match(buildSource, /POPO-Dev-Downloader-|popo-dev-downloader-/i);
   assert.match(buildSource, /Import-Module \$devExtensionModulePath -Force/);
   assert.match(devExtensionModule, /folfhehnopknchpoaajfpboibbhnlanf/);
-  assert.match(buildSource, /if \(-not \$isDev\) \{[\s\S]*signature = \$signature/);
+  assert.match(buildSource, /if \(-not \$isDev\) \{[\s\S]*signature = \$manifestSignature/);
 });
 
 test("绿色安装助手自动准备完整运行目录并引导加载扩展", () => {
@@ -132,7 +132,7 @@ test("绿色安装助手自动准备完整运行目录并引导加载扩展", ()
   assert.match(buildSource, /latest\.json/);
   assert.match(buildSource, /channel = 'stable'/);
   assert.match(buildSource, /ProtectedData/);
-  assert.match(buildSource, /signature = \$signature/);
+  assert.match(buildSource, /signature = \$manifestSignature/);
   assert.match(buildSource, /popo-package-compile-/);
   assert.match(buildSource, /GetTempPath/);
   assert.match(devExtensionModule, /'queue\.js'/);

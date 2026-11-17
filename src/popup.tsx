@@ -16,7 +16,9 @@ import {
   networkHealthSummary,
   recoverableCount,
   summarizeLiveJobs,
+  updateFailureGuidance,
   userFacingError,
+  GITHUB_RELEASES_URL,
   type GopeedConnection,
   type GopeedSettings,
   type NetworkHealth,
@@ -256,6 +258,34 @@ function updateStatusLabel(status: UpdateStatus | null): string {
   return "";
 }
 
+// ====== A failed status read triggers a re-check (failed -> checking -> failed). Keep the last failure on screen meanwhile. ======
+function useStickyFailure(status: UpdateStatus | null): UpdateStatus | null {
+  const lastFailure = useRef<UpdateStatus | null>(null);
+  if (status?.state === "failed") {
+    lastFailure.current = status;
+  } else if (!status || !["starting", "checking"].includes(status.state)) {
+    lastFailure.current = null;
+  }
+  return lastFailure.current;
+}
+
+function UpdateFailureNotice({ status }: { status: UpdateStatus | null }) {
+  const guidance = updateFailureGuidance(useStickyFailure(status));
+  if (!guidance) return null;
+  return (
+    <section className="update-failure" role="status">
+      <strong>{guidance.title}</strong>
+      <p>{guidance.hint}</p>
+      <p>
+        也可以开启代理后，到{" "}
+        <a href={GITHUB_RELEASES_URL} target="_blank" rel="noreferrer">GitHub 下载安装包</a>{" "}
+        手动升级（运行安装包即可覆盖升级，会保留设置和下载记录）。
+      </p>
+      {guidance.detail && <p className="update-failure-detail">详情：{guidance.detail}</p>}
+    </section>
+  );
+}
+
 function PopupApp() {
   usePopupPresence();
   const updateStatus = useUpdateStatus();
@@ -383,6 +413,7 @@ function PopupApp() {
       <p id="errorBox" className="error" hidden={!error}>
         {error?.message || ""}
       </p>
+      <UpdateFailureNotice status={updateStatus} />
       <footer id="versionInfo" title={updateStatus?.message || ""}>
         <span>版本 {version}{updateStatusLabel(updateStatus)}</span>
         {devSyncBatch && <span id="devSyncBatch">{devSyncBatch}</span>}

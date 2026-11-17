@@ -154,7 +154,8 @@ test("development green package is isolated from the stable release channel", ()
     "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-test-package.ps1 -Channel Stable"
   );
   assert.match(buildScript, /\$channelManifestPath = if \(\$isDev\) \{ '' \}/);
-  assert.match(buildScript, /if \(-not \$isDev\) \{[\s\S]*\$channelManifest = \[ordered\]@\{/);
+  assert.match(buildScript, /if \(-not \$isDev\) \{[\s\S]*New-ChannelManifest \$downloadUrl \$signature/);
+  assert.match(buildScript, /\$githubManifestPath = if \(\$isDev\) \{ '' \}/);
   assert.match(buildScript, /DEV-TESTING\.md/);
   assert.match(buildScript, /Import-Module \$devExtensionModulePath -Force/);
   assert.match(buildScript, /Copy-PopoExtensionSource[^\n]+-Channel \$Channel/);
@@ -378,4 +379,31 @@ test("shadow cycle verification is local, read-only and evidence bounded", () =>
   assert.match(shadowCycleVerifier, /NetworkUsed: false/);
   assert.match(shadowCycleVerifier, /StateChanged: false/);
   assert.doesNotMatch(shadowCycleVerifier, /https?:\/\/|fetch\(|request\(|writeFile|rmSync|unlinkSync/);
+});
+
+test("release also signs and publishes a GitHub backup manifest; only the COS manifest switches the channel", () => {
+  const host = fs.readFileSync(path.join(root, "native-host", "FolderPickerHost.cs"), "utf8");
+  // build: a second manifest, same release, GitHub URL, signed separately
+  assert.match(buildScript, /\[string\]\$GitHubRepository = 'mxwayne\/popo-downloader'/);
+  assert.match(buildScript, /latest\.github\.json/);
+  assert.match(buildScript, /releases\/download\/v\$versionName\/\$artifactName/);
+  assert.match(buildScript, /\$githubSignature/);
+  assert.match(buildScript, /Get-ManifestCanonical \$githubDownloadUrl/);
+  // the PowerShell scripts must stay ASCII: Windows PowerShell 5.1 reads BOM-less UTF-8 as ANSI
+  assert.doesNotMatch(buildScript, /[^\x00-\x7f]/);
+  assert.doesNotMatch(packageVerifier, /[^\x00-\x7f]/);
+  // verify: same release fields, fixed URL shape and its own signature
+  assert.match(packageVerifier, /latest\.github\.json field '\$field' does not match latest\.json/);
+  assert.match(packageVerifier, /releases\/download\/v\$\(\$manifest\.version\)\/\$\(\$manifest\.artifact\)/);
+  assert.match(packageVerifier, /latest\.github\.json release signature is invalid/);
+  // workflow: the backup manifest is a required Release asset, but only latest.json is published to COS
+  assert.ok((workflow.match(/latest\.github\.json/g) || []).length >= 3);
+  assert.doesNotMatch(workflow, /publish-cos-object\.py[^\n]*latest\.github\.json/);
+  // client: fixed repository, redirects followed by hand and only to approved GitHub hosts
+  assert.match(host, /GitHubUpdateManifestUrl\s*=\s*\r?\n?\s*"https:\/\/github\.com\/mxwayne\/popo-downloader\/releases\/latest\/download\/latest\.github\.json"/);
+  assert.match(host, /GetWithValidatedRedirects/);
+  assert.match(host, /IsAllowedGitHubUrl/);
+  assert.match(host, /objects\.githubusercontent\.com/);
+  assert.doesNotMatch(host, /AllowAutoRedirect\s*=\s*true/);
+  assert.match(host, /VerifyDownloadedPackage\(manifest, archivePath\)/);
 });

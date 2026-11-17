@@ -22,6 +22,20 @@ internal static class FolderPickerHost
     private const string UpdateManifestUrl = "https://popo-updates-1461466196.cos.ap-guangzhou.myqcloud.com/stable/latest.json";
     private const string UpdateHost = "popo-updates-1461466196.cos.ap-guangzhou.myqcloud.com";
     private const string UpdatePathPrefix = "/stable/";
+    // GitHub 备用更新源：清单与安装包都由发布流程上传到 Release；清单单独签名（签名覆盖下载地址）。
+    private const string GitHubUpdateManifestUrl =
+        "https://github.com/mxwayne/popo-downloader/releases/latest/download/latest.github.json";
+    private const string GitHubHost = "github.com";
+    private const string GitHubRepositoryPath = "/mxwayne/popo-downloader/";
+    private static readonly string[] GitHubAssetHosts = new[] {
+        "objects.githubusercontent.com",
+        "release-assets.githubusercontent.com",
+        "github-releases.githubusercontent.com"
+    };
+    private const int MaxUpdateRedirects = 5;
+
+    private enum UpdateSource { Cos, GitHub }
+
     private const string UpdateSigningPublicKeyBase64 = "PFJTQUtleVZhbHVlPjxNb2R1bHVzPndxcWxuZzZkTVZRbHhBUGhpcXl2UC90ZkZmSVdXUVRMakpXaWpzZ3dNcldrUFpBeUtPdlkxNVVLbkQzTmlpSVYzNmtYMnlLZDBIcUZDcEVwcTZoN1pqaTh5bW1ocHJFWGNSTVhaODFiUkV0aTQ5bFpvdlNJUHp0dE42NG9MUHVxa1ZlSnVWQzZHRnlLY1ZxZWVqemJDQW9wWWRKNGdNMFJ3akNLTDlobks0Z1BUVHdCTzBaeEpid0w5b1FUL2NVSnRhVkg1OTVJUVlnRFZYdld1L0Y4aFRuVGZPOTZrRGtTaE03TzNjaDBLQzU5dDZaNW92U3pxeEV2bVB4bzEydnV6NFFaQ2ZJNUdMcGQ5eUNJMVhOWW5YS3E3TndCTFhlRFJvMnIrTTNwQWE1SldmRWZvOVdHcVF1d3J2ajlMSVQxeGhrTjJBbWRZUWl2WXh2eEVpUVBJQTVNV1FRNG9ReFZlSzZwSXRPdmxvcnNrV0kxV25Ed3JpcWRTMVIvT3plU242VVpoa1NiTC9IZWZpSElzd2tRL2lWYlUwYUJKSmpJYWRyUnV1dXpBMWFicy82enRhMkVxUFg2WEVlZ29tTkRrNTBHeGtJTnVYMkIzbmZ6b2gwVWlZc1k2OU1iNXZkVGtjUEkzZVYraXh3UXdYVFEvaEprRVVsOTRBRlZKM0doPC9Nb2R1bHVzPjxFeHBvbmVudD5BUUFCPC9FeHBvbmVudD48L1JTQUtleVZhbHVlPg==";
     private static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
 
@@ -32,6 +46,10 @@ internal static class FolderPickerHost
         {
             return RunDetachedUpdater(args);
         }
+#if POPO_NATIVEHOST_TEST
+        if (HasArgument(args, "--test-validate-manifest")) return RunTestValidateManifest(args);
+        if (HasArgument(args, "--test-check-url")) return RunTestCheckUrl(args);
+#endif
         try
         {
             Dictionary<string, object> request = ReadMessage();
@@ -150,6 +168,40 @@ internal static class FolderPickerHost
             TopMost = true
         };
     }
+
+#if POPO_NATIVEHOST_TEST
+    // 测试入口：校验一份清单文件（argv: --test-validate-manifest <json> <cos|github> <结果文件>）。
+    private static int RunTestValidateManifest(string[] args)
+    {
+        int index = Array.IndexOf(args, "--test-validate-manifest");
+        string result;
+        try
+        {
+            UpdateManifest manifest = Json.Deserialize<UpdateManifest>(File.ReadAllText(args[index + 1]));
+            UpdateSource source = String.Equals(args[index + 2], "github", StringComparison.OrdinalIgnoreCase)
+                ? UpdateSource.GitHub
+                : UpdateSource.Cos;
+            ValidateUpdateManifest(manifest, source);
+            result = "OK";
+        }
+        catch (Exception error)
+        {
+            result = "ERR:" + error.Message;
+        }
+        File.WriteAllText(args[index + 3], result, new UTF8Encoding(false));
+        return 0;
+    }
+
+    // 测试入口：判断一个地址能否作为更新重定向目标（argv: --test-check-url <url> <结果文件>）。
+    private static int RunTestCheckUrl(string[] args)
+    {
+        int index = Array.IndexOf(args, "--test-check-url");
+        Uri uri;
+        bool allowed = Uri.TryCreate(args[index + 1], UriKind.Absolute, out uri) && IsAllowedGitHubUrl(uri);
+        File.WriteAllText(args[index + 2], allowed ? "ALLOWED" : "DENIED", new UTF8Encoding(false));
+        return 0;
+    }
+#endif
 
     private sealed class UpdateManifest
     {
@@ -314,8 +366,30 @@ internal static class FolderPickerHost
             Directory.CreateDirectory(workRoot);
 
             WriteUpdateStatus(productRoot, "downloading", currentVersion, manifest.version, "Downloading verified update package.");
-            DownloadUpdatePackage(manifest, archivePath);
-            VerifyDownloadedPackage(manifest, archivePath);
+            try
+            {
+                DownloadUpdatePackage(manifest, archivePath);
+                VerifyDownloadedPackage(manifest, archivePath);
+            }
+            catch (Exception downloadError)
+            {
+                // 清单来自腾讯云但安装包下载失败：同一版本的 GitHub 清单（同样经过签名校验）可以作为备用。
+                UpdateManifest fallback = null;
+                if (String.Equals(new Uri(manifest.url).Host, UpdateHost, StringComparison.OrdinalIgnoreCase))
+                {
+                    try { fallback = FetchUpdateManifest(UpdateSource.GitHub); } catch {}
+                }
+                if (fallback == null || !String.Equals(fallback.version, manifest.version, StringComparison.Ordinal))
+                {
+                    throw downloadError;
+                }
+                manifest = fallback;
+                try { if (File.Exists(archivePath)) File.Delete(archivePath); } catch {}
+                archivePath = Path.Combine(workRoot, manifest.artifact);
+                WriteUpdateStatus(productRoot, "downloading", currentVersion, manifest.version, "Downloading verified update package from the GitHub backup source.");
+                DownloadUpdatePackage(manifest, archivePath);
+                VerifyDownloadedPackage(manifest, archivePath);
+            }
 
             WriteUpdateStatus(productRoot, "installing", currentVersion, manifest.version, "Installing verified candidate package.");
             ExtractUpdatePackage(archivePath, extractRoot);
@@ -368,33 +442,132 @@ internal static class FolderPickerHost
         }
     }
 
+    // 先读腾讯云清单；失败（网络、校验）时改读 GitHub 清单。GitHub 清单同样必须通过签名校验，
+    // 所以放宽来源不会削弱完整性保证。两个来源都失败时抛出腾讯云那次的错误，保持原有的错误分类。
     private static UpdateManifest ReadAndValidateUpdateManifest()
     {
-        ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;
-        HttpWebRequest request = (HttpWebRequest)WebRequest.Create(UpdateManifestUrl);
-        request.Method = "GET";
-        request.AllowAutoRedirect = false;
-        request.KeepAlive = false;
-        request.Timeout = 10000;
-        request.ReadWriteTimeout = 10000;
-        request.UserAgent = "POPOStableDownloader-Updater/1";
-        string json;
-        using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
-        using (StreamReader reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
+        try
         {
-            if (response.StatusCode != HttpStatusCode.OK)
+            return FetchUpdateManifest(UpdateSource.Cos);
+        }
+        catch (Exception cosError)
+        {
+            try
             {
-                throw new InvalidDataException("The update service returned HTTP " + (int)response.StatusCode + ".");
+                return FetchUpdateManifest(UpdateSource.GitHub);
             }
-            json = reader.ReadToEnd();
+            catch
+            {
+                throw cosError;
+            }
+        }
+    }
+
+    private static UpdateManifest FetchUpdateManifest(UpdateSource source)
+    {
+        ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;
+        string json;
+        if (source == UpdateSource.Cos)
+        {
+            HttpWebRequest request = (HttpWebRequest)WebRequest.Create(UpdateManifestUrl);
+            request.Method = "GET";
+            request.AllowAutoRedirect = false;
+            request.KeepAlive = false;
+            request.Timeout = 10000;
+            request.ReadWriteTimeout = 10000;
+            request.UserAgent = "POPOStableDownloader-Updater/1";
+            using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
+            using (StreamReader reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
+            {
+                if (response.StatusCode != HttpStatusCode.OK)
+                {
+                    throw new InvalidDataException("The update service returned HTTP " + (int)response.StatusCode + ".");
+                }
+                json = reader.ReadToEnd();
+            }
+        }
+        else
+        {
+            using (HttpWebResponse response = GetWithValidatedRedirects(GitHubUpdateManifestUrl, 10000, 10000))
+            using (StreamReader reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
+            {
+                if (response.StatusCode != HttpStatusCode.OK)
+                {
+                    throw new InvalidDataException("The GitHub update source returned HTTP " + (int)response.StatusCode + ".");
+                }
+                json = reader.ReadToEnd();
+            }
         }
 
         UpdateManifest manifest = Json.Deserialize<UpdateManifest>(json);
-        ValidateUpdateManifest(manifest);
+        ValidateUpdateManifest(manifest, source);
         return manifest;
     }
 
-    private static void ValidateUpdateManifest(UpdateManifest manifest)
+    // GitHub 下载会 302 到它自己的资产域名。逐跳手动跟随，每一跳都校验目标，不使用自动重定向。
+    private static HttpWebResponse GetWithValidatedRedirects(string url, int timeoutMs, int readWriteTimeoutMs)
+    {
+        string current = url;
+        for (int hop = 0; hop <= MaxUpdateRedirects; hop++)
+        {
+            Uri currentUri = new Uri(current);
+            if (!IsAllowedGitHubUrl(currentUri))
+            {
+                throw new InvalidDataException("The update redirect target is not an approved GitHub address.");
+            }
+            HttpWebRequest request = (HttpWebRequest)WebRequest.Create(currentUri);
+            request.Method = "GET";
+            request.AllowAutoRedirect = false;
+            request.KeepAlive = false;
+            request.Timeout = timeoutMs;
+            request.ReadWriteTimeout = readWriteTimeoutMs;
+            request.UserAgent = "POPOStableDownloader-Updater/1";
+            HttpWebResponse response = (HttpWebResponse)request.GetResponse();
+            int code = (int)response.StatusCode;
+            if (code >= 300 && code < 400)
+            {
+                string location = response.Headers["Location"];
+                response.Close();
+                Uri next;
+                if (String.IsNullOrWhiteSpace(location) || !Uri.TryCreate(currentUri, location, out next))
+                {
+                    throw new InvalidDataException("The update redirect is missing a valid target.");
+                }
+                current = next.AbsoluteUri;
+                continue;
+            }
+            return response;
+        }
+        throw new InvalidDataException("The update service redirected too many times.");
+    }
+
+    // 只允许 https、默认端口、无用户信息，并且主机属于仓库页面或 GitHub 的发布资产域名。
+    private static bool IsAllowedGitHubUrl(Uri uri)
+    {
+        if (uri == null || !uri.IsAbsoluteUri) return false;
+        if (!String.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)) return false;
+        if (uri.Port != 443 || !String.IsNullOrEmpty(uri.UserInfo)) return false;
+        if (String.Equals(uri.Host, GitHubHost, StringComparison.OrdinalIgnoreCase))
+        {
+            return uri.AbsolutePath.StartsWith(GitHubRepositoryPath, StringComparison.Ordinal);
+        }
+        foreach (string host in GitHubAssetHosts)
+        {
+            if (String.Equals(uri.Host, host, StringComparison.OrdinalIgnoreCase)) return true;
+        }
+        return false;
+    }
+
+    private static string GetUpdatePublicKeyBase64()
+    {
+#if POPO_NATIVEHOST_TEST
+        string overrideKey = Environment.GetEnvironmentVariable("POPO_NATIVEHOST_TEST_PUBLIC_KEY_B64");
+        if (!String.IsNullOrEmpty(overrideKey)) return overrideKey;
+#endif
+        return UpdateSigningPublicKeyBase64;
+    }
+
+    private static void ValidateUpdateManifest(UpdateManifest manifest, UpdateSource source)
     {
         if (manifest == null || manifest.schemaVersion != 1)
         {
@@ -422,13 +595,29 @@ internal static class FolderPickerHost
         }
 
         Uri packageUri;
-        if (!Uri.TryCreate(manifest.url, UriKind.Absolute, out packageUri) ||
-            !String.Equals(packageUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ||
-            !String.Equals(packageUri.Host, UpdateHost, StringComparison.OrdinalIgnoreCase) ||
-            !packageUri.AbsolutePath.StartsWith(UpdatePathPrefix, StringComparison.Ordinal) ||
-            !String.Equals(Path.GetFileName(packageUri.LocalPath), manifest.artifact, StringComparison.Ordinal))
+        if (source == UpdateSource.Cos)
         {
-            throw new InvalidDataException("The update package URL is not an approved COS object.");
+            if (!Uri.TryCreate(manifest.url, UriKind.Absolute, out packageUri) ||
+                !String.Equals(packageUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ||
+                !String.Equals(packageUri.Host, UpdateHost, StringComparison.OrdinalIgnoreCase) ||
+                !packageUri.AbsolutePath.StartsWith(UpdatePathPrefix, StringComparison.Ordinal) ||
+                !String.Equals(Path.GetFileName(packageUri.LocalPath), manifest.artifact, StringComparison.Ordinal))
+            {
+                throw new InvalidDataException("The update package URL is not an approved COS object.");
+            }
+        }
+        else
+        {
+            // 地址必须是本仓库当前版本的 Release 资产：/mxwayne/popo-downloader/releases/download/v<版本>/<文件名>。
+            string expectedPrefix = GitHubRepositoryPath + "releases/download/v" + manifest.version + "/";
+            if (!Uri.TryCreate(manifest.url, UriKind.Absolute, out packageUri) ||
+                !String.Equals(packageUri.Host, GitHubHost, StringComparison.OrdinalIgnoreCase) ||
+                !IsAllowedGitHubUrl(packageUri) ||
+                !packageUri.AbsolutePath.StartsWith(expectedPrefix, StringComparison.Ordinal) ||
+                !String.Equals(Path.GetFileName(packageUri.LocalPath), manifest.artifact, StringComparison.Ordinal))
+            {
+                throw new InvalidDataException("The update package URL is not an approved GitHub release asset.");
+            }
         }
 
         string canonical = CanonicalUpdateManifest(manifest);
@@ -441,7 +630,7 @@ internal static class FolderPickerHost
         {
             throw new InvalidDataException("The update signature encoding is invalid.");
         }
-        string publicXml = Encoding.UTF8.GetString(Convert.FromBase64String(UpdateSigningPublicKeyBase64));
+        string publicXml = Encoding.UTF8.GetString(Convert.FromBase64String(GetUpdatePublicKeyBase64()));
         using (RSACryptoServiceProvider rsa = new RSACryptoServiceProvider())
         {
             rsa.FromXmlString(publicXml);
@@ -474,15 +663,26 @@ internal static class FolderPickerHost
     private static void DownloadUpdatePackage(UpdateManifest manifest, string destination)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(destination));
-        HttpWebRequest request = (HttpWebRequest)WebRequest.Create(manifest.url);
-        request.Method = "GET";
-        request.AllowAutoRedirect = false;
-        request.KeepAlive = false;
-        request.Timeout = 15000;
-        request.ReadWriteTimeout = 60000;
-        request.UserAgent = "POPOStableDownloader-Updater/1";
+        Uri packageUri = new Uri(manifest.url);
+        bool fromGitHub = String.Equals(packageUri.Host, GitHubHost, StringComparison.OrdinalIgnoreCase);
+        HttpWebResponse response;
+        if (fromGitHub)
+        {
+            response = GetWithValidatedRedirects(manifest.url, 15000, 60000);
+        }
+        else
+        {
+            HttpWebRequest request = (HttpWebRequest)WebRequest.Create(manifest.url);
+            request.Method = "GET";
+            request.AllowAutoRedirect = false;
+            request.KeepAlive = false;
+            request.Timeout = 15000;
+            request.ReadWriteTimeout = 60000;
+            request.UserAgent = "POPOStableDownloader-Updater/1";
+            response = (HttpWebResponse)request.GetResponse();
+        }
         long written = 0;
-        using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
+        using (response)
         using (Stream input = response.GetResponseStream())
         using (FileStream output = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None))
         {

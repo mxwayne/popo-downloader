@@ -391,6 +391,30 @@ test("任务成功完成后列表里没有任务，页面仍通过完成凭证�
   await expect(toast).toHaveCount(1);
 });
 
+test("自动更新失败时弹窗显示原因、退出 Gopeed 的指引和 GitHub 手动升级入口", async () => {
+  // 用全新的浏览器资料目录：前面用例遗留的下载任务会让后台把更新记为“已延后”，失败提示随之消失。
+  userDataDir = join(sandboxRoot, "profile-update-failure");
+  const { worker, extensionId } = await launchExtension();
+  const popup = await openPopup(extensionId);
+  await worker.evaluate(async () => {
+    // Windows 上沙箱扩展可能连到真实本机助手并得到“已是最新”；固定为“本机助手不可用”，结果与运行机器无关。
+    chrome.runtime.sendNativeMessage = () => Promise.reject(new Error("Specified native messaging host not found."));
+    await chrome.storage.local.set({ popoUpdateStatus: {
+      state: "failed", currentVersion: "0.7.8", targetVersion: "0.8.0",
+      message: "The verified setup process failed with exit code 1.", updatedAt: new Date().toISOString()
+    } });
+  });
+  await popup.reload();
+  const notice = popup.locator(".update-failure");
+  await expect(notice).toBeVisible();
+  // 读取失败状态会触发一次重新检查，沙箱里没有本机助手，最终原因会变；任何失败原因都应带上 GitHub 入口。
+  await expect(notice.getByRole("link", { name: "GitHub 下载安装包" })).toHaveAttribute(
+    "href", "https://github.com/mxwayne/popo-downloader/releases/latest"
+  );
+  await expect(notice).toContainText("自动更新失败");
+  await popup.screenshot({ path: resolve(projectRoot, "output/update-failure-notice.png"), fullPage: true });
+});
+
 test("接口桥只放行 folderSubList 的模板请求体，其余路径、方法、字段被拒绝", async () => {
   await launchExtension();
   const page = await context.newPage();

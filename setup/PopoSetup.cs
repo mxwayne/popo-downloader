@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
@@ -1711,17 +1712,17 @@ internal static class PopoSetup
             }
             if (extensionChanged && Directory.Exists(extensionRoot))
             {
-                Directory.Move(extensionRoot, rollbackExtension);
+                MoveDirectoryResilient(extensionRoot, rollbackExtension, productRoot);
                 previousExtensionBackedUp = true;
             }
             if (nativeChanged && Directory.Exists(nativeRoot))
             {
-                Directory.Move(nativeRoot, rollbackNative);
+                MoveDirectoryResilient(nativeRoot, rollbackNative, productRoot);
                 previousNativeBackedUp = true;
             }
             if (agentChanged && Directory.Exists(agentRoot))
             {
-                Directory.Move(agentRoot, rollbackAgent);
+                MoveDirectoryResilient(agentRoot, rollbackAgent, productRoot);
                 previousAgentBackedUp = true;
             }
             if ((extensionChanged || nativeChanged || agentChanged) && File.Exists(installStatePath))
@@ -2344,7 +2345,7 @@ internal static class PopoSetup
             try
             {
                 if (!String.Equals(
-                    Path.GetFullPath(process.MainModule.FileName),
+                    TryGetProcessPath(process),
                     fullExpectedPath,
                     StringComparison.OrdinalIgnoreCase
                 )) continue;
@@ -2366,19 +2367,148 @@ internal static class PopoSetup
         return !IsProcessRunningAt(fullExpectedPath);
     }
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, int processId);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool QueryFullProcessImageName(
+        IntPtr process,
+        int flags,
+        StringBuilder executablePath,
+        ref int size
+    );
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    private static readonly HashSet<int> UnreadableProcessIds = new HashSet<int>();
+
+    // 读取进程路径：先用主模块；权限不够时改用只需要“有限查询”权限的接口。
+    // 两种办法都失败返回空串，调用方不能把空串当成“没在运行”而放过。
+    private static string TryGetProcessPath(Process process)
+    {
+        try { return Path.GetFullPath(process.MainModule.FileName); }
+        catch {}
+        IntPtr handle = IntPtr.Zero;
+        try
+        {
+            handle = OpenProcess(0x1000, false, process.Id);
+            if (handle == IntPtr.Zero) return "";
+            StringBuilder buffer = new StringBuilder(1024);
+            int size = buffer.Capacity;
+            if (!QueryFullProcessImageName(handle, 0, buffer, ref size)) return "";
+            return Path.GetFullPath(buffer.ToString(0, size));
+        }
+        catch { return ""; }
+        finally
+        {
+            if (handle != IntPtr.Zero) CloseHandle(handle);
+        }
+    }
+
+    private static bool PathIsUnder(string path, string root)
+    {
+        if (String.IsNullOrEmpty(path) || String.IsNullOrEmpty(root)) return false;
+        string prefix = Path.GetFullPath(root).TrimEnd('\\') + "\\";
+        return path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string DescribeProcessesUnder(string productRoot)
+    {
+        List<string> names = new List<string>();
+        foreach (Process process in Process.GetProcesses())
+        {
+            try
+            {
+                if (PathIsUnder(TryGetProcessPath(process), productRoot))
+                {
+                    names.Add(process.ProcessName + "#" + process.Id);
+                }
+            }
+            catch {}
+            finally { process.Dispose(); }
+        }
+        return names.Count == 0 ? "（没有读到任何进程）" : String.Join(", ", names.ToArray());
+    }
+
+    // 结束产品目录内的 Gopeed（它会一直打开自己的数据库文件，使整个目录无法被重命名）。
+    private static void StopProductGopeed(string productRoot)
+    {
+        foreach (Process process in Process.GetProcessesByName("gopeed"))
+        {
+            try
+            {
+                if (!PathIsUnder(TryGetProcessPath(process), productRoot)) continue;
+                try
+                {
+                    if (process.CloseMainWindow()) process.WaitForExit(1500);
+                }
+                catch {}
+                if (!process.HasExited)
+                {
+                    process.Kill();
+                    process.WaitForExit(5000);
+                }
+            }
+            catch {}
+            finally { process.Dispose(); }
+        }
+    }
+
+    // 目录被占用（访问被拒绝）时，先结束产品目录内的 Gopeed 再重试；其他占用多半是瞬时的，等一会儿再试。
+    private static void MoveDirectoryResilient(string source, string destination, string productRoot)
+    {
+        int attempt = 0;
+        while (true)
+        {
+            try
+            {
+                Directory.Move(source, destination);
+                return;
+            }
+            catch (Exception error)
+            {
+                bool retriable = error is IOException || error is UnauthorizedAccessException;
+                if (!retriable || attempt >= 3)
+                {
+                    AppendSetupLog("无法移动目录，当前占用产品目录的进程：" + DescribeProcessesUnder(productRoot));
+                    throw;
+                }
+                AppendSetupLog("目录被占用，结束产品目录内的 Gopeed 后重试：" + source);
+                StopProductGopeed(productRoot);
+                Thread.Sleep(600);
+                attempt++;
+            }
+        }
+    }
+
     private static bool IsProcessRunningAt(string expectedPath)
     {
+#if POPO_SETUP_TEST
+        // 测试开关：让安装器“看不见”正在运行的 Gopeed，复现现场里检测失败的症状。
+        if (Environment.GetEnvironmentVariable("POPO_SETUP_TEST_HIDE_GOPEED_DETECTION") == "1" &&
+            String.Equals(Path.GetFileName(expectedPath), "gopeed.exe", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+#endif
         string fullExpectedPath = Path.GetFullPath(expectedPath);
         string processName = Path.GetFileNameWithoutExtension(fullExpectedPath);
         foreach (Process process in Process.GetProcessesByName(processName))
         {
             try
             {
-                if (String.Equals(
-                    Path.GetFullPath(process.MainModule.FileName),
-                    fullExpectedPath,
-                    StringComparison.OrdinalIgnoreCase
-                )) return true;
+                string actualPath = TryGetProcessPath(process);
+                if (String.IsNullOrEmpty(actualPath))
+                {
+                    // 同名进程读不到路径：记一次日志，方便下次失败时看出“检测失败”而不是“没在运行”。
+                    if (UnreadableProcessIds.Add(process.Id))
+                    {
+                        AppendSetupLog("无法读取进程路径：" + processName + "#" + process.Id);
+                    }
+                    continue;
+                }
+                if (String.Equals(actualPath, fullExpectedPath, StringComparison.OrdinalIgnoreCase)) return true;
             }
             catch {}
             finally { process.Dispose(); }

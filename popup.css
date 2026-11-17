@@ -784,3 +784,9 @@ footer {
 /* 展开失败明细时解除任务列表的 300px 上限，只保留明细自身一层滚动。 */
 .popup-queue-list:has(.popo-detail-failures[open]) { max-height: none; }
 .popo-detail-timing { margin-top: 6px; color: #9fb4c8; font-size: 11px; }
+/* 自动更新失败提示：说明原因，并给出退出 Gopeed 重试与 GitHub 手动升级两条路。 */
+.update-failure { margin: 10px 0 0; padding: 10px 12px; border: 1px solid #7a4a52; border-radius: 10px; background: #3a1f26; color: #f2d5da; font-size: 12px; line-height: 1.5; }
+.update-failure strong { display: block; margin-bottom: 4px; color: #ffb7c0; }
+.update-failure p { margin: 4px 0 0; }
+.update-failure a { color: #9fd0ff; }
+.update-failure-detail { color: #c9a9ae; font-size: 11px; overflow-wrap: anywhere; }

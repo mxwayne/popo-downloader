@@ -49,10 +49,15 @@ function buildFixture(packageRoot, versionName, marker, options = {}) {
   fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
   fs.appendFileSync(
     path.join(extensionRoot, "runtime", "popup.js"),
-    "\n// " + marker + "\n",
+    "\n// " + (options.extensionMarker ?? marker) + "\n",
     "utf8"
   );
-  fs.writeFileSync(path.join(gopeedRoot, "gopeed.exe"), "fixture-gopeed", "utf8");
+  if (options.gopeedExecutable) {
+    // 安装后的 gopeed.exe 与候选包完全一致，才能模拟“原生部分没变、Gopeed 正在运行”。
+    fs.copyFileSync(options.gopeedExecutable, path.join(gopeedRoot, "gopeed.exe"));
+  } else {
+    fs.writeFileSync(path.join(gopeedRoot, "gopeed.exe"), "fixture-gopeed", "utf8");
+  }
   fs.writeFileSync(path.join(gopeedRoot, "libgopeed.dll"), "fixture-libgopeed", "utf8");
   fs.writeFileSync(
     path.join(gopeedRoot, ".popo-bundle-version"),
@@ -141,7 +146,8 @@ function runSetup(setupExecutable, installRoot, options = {}) {
       POPO_SETUP_TEST_FAIL_AGENT_STARTUP: options.failAgentStartup ? "1" : "",
       POPO_SETUP_TEST_SCHTASKS_DENIED: options.schtasksDenied ? "1" : "",
       POPO_SETUP_TEST_FAIL_AGENT_RUN_STARTUP: options.failAgentRunStartup ? "1" : "",
-      POPO_SETUP_TEST_SKIP_AGENT_START: options.skipAgentStart ? "1" : ""
+      POPO_SETUP_TEST_SKIP_AGENT_START: options.skipAgentStart ? "1" : "",
+      POPO_SETUP_TEST_HIDE_GOPEED_DETECTION: options.hideGopeedDetection ? "1" : ""
     }
   });
 }
@@ -332,8 +338,17 @@ internal static class GopeedSentinel
 
     private static int Main(string[] args)
     {
+        // 真实的 Gopeed 会长期打开自己 storage 目录里的数据库文件（不允许删除或重命名）。
+        // 第二个参数给出一个要占用的文件，用来复现“目录整体被重命名时访问被拒绝”。
+        FileStream holder = null;
+        if (args.Length > 1)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(args[1]));
+            holder = new FileStream(args[1], FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
+        }
         WriteAtomically(args[0], Process.GetCurrentProcess().Id.ToString());
         Thread.Sleep(Timeout.Infinite);
+        GC.KeepAlive(holder);
         return 0;
     }
 }
@@ -677,6 +692,83 @@ test("修复时暂停扩展自动拉起 Gopeed，自动退出后继续并恢复�
     fs.rmSync(sandbox, { recursive: true, force: true });
   }
 });
+
+for (const scenario of [
+  { name: "原生部分有变化", nativeMarker: "b", expectGopeedStopped: true },
+  { name: "只有扩展有变化（原生部分与 Gopeed 完全相同）", nativeMarker: "a", expectGopeedStopped: false },
+  // 现场症状：安装器检测不到正在运行的 Gopeed（进程路径读取失败被当作“没在运行”）。
+  { name: "原生部分有变化且检测不到 Gopeed 进程", nativeMarker: "b", expectGopeedStopped: true, hideGopeedDetection: true }
+]) {
+  test(`普通更新（非修复）时 Gopeed 正在运行：${scenario.name}也能完成更新`, {
+    timeout: 90_000
+  }, async (t) => {
+    if (!fs.existsSync(compiler)) {
+      t.skip("Windows .NET Framework compiler is unavailable");
+      return;
+    }
+    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "popo-update-gopeed-"));
+    const packageA = path.join(sandbox, "package-a");
+    const packageB = path.join(sandbox, "package-b");
+    const installRoot = path.join(sandbox, "installed");
+    const sentinel = path.join(sandbox, "sentinel", "gopeed.exe");
+    const gopeedReady = path.join(sandbox, "gopeed-sentinel.ready");
+    let gopeedProcess;
+    let update;
+    const describeFailure = () => {
+      const logPath = path.join(sandbox, "local-appdata", "POPOStableDownloader", "Logs", "setup.log");
+      return [
+        `gopeed pid=${gopeedProcess?.pid ?? "none"}; exitCode=${gopeedProcess?.exitCode ?? "null"}`,
+        `setup status=${update?.status ?? "not-started"}`,
+        `setup stdout=${update?.stdout ?? ""}`,
+        `setup stderr=${update?.stderr ?? ""}`,
+        `setup.log=${fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf8") : "missing"}`
+      ].join("\n");
+    };
+    try {
+      fs.mkdirSync(path.dirname(sentinel), { recursive: true });
+      compileGopeedSentinel(sentinel);
+      buildFixture(packageA, "0.7.5", "a", { gopeedExecutable: sentinel });
+      const setupA = compileSetup(packageA);
+      const initial = runSetup(setupA, installRoot, { register: true, skipAgentStart: true });
+      assert.equal(initial.status, 0, initial.stdout + initial.stderr);
+
+      gopeedProcess = spawn(
+        path.join(installRoot, "NativeHost", "Gopeed", "gopeed.exe"),
+        [gopeedReady, path.join(installRoot, "NativeHost", "Gopeed", "storage", "hive.lock")],
+        { windowsHide: true, stdio: "ignore" }
+      );
+      await waitForHelperReady(gopeedProcess, gopeedReady, "Gopeed sentinel", describeFailure);
+
+      buildFixture(packageB, "0.7.6", scenario.nativeMarker, {
+        gopeedExecutable: sentinel,
+        extensionMarker: "extension-b"
+      });
+      const setupB = compileSetup(packageB);
+      update = runSetup(setupB, installRoot, {
+        register: true,
+        skipAgentStart: true,
+        hideGopeedDetection: Boolean(scenario.hideGopeedDetection)
+      });
+      assert.equal(update.status, 0, describeFailure());
+      const installedManifest = JSON.parse(
+        fs.readFileSync(path.join(installRoot, "Extension", "manifest.json"), "utf8")
+      );
+      assert.equal(installedManifest.version_name, "0.7.6", describeFailure());
+      assert.equal(readInstallState(installRoot).version, "0.7.6");
+      if (scenario.expectGopeedStopped) {
+        await waitForCondition(() => childHasExited(gopeedProcess), {
+          timeoutMs: 8_000,
+          describeFailure: () => "Setup did not stop the running Gopeed\n" + describeFailure()
+        });
+      } else {
+        assert.ok(!childHasExited(gopeedProcess), "原生部分没变时不应打断正在运行的 Gopeed\n" + describeFailure());
+      }
+    } finally {
+      await stopChildProcess(gopeedProcess, "Gopeed sentinel");
+      fs.rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+}
 
 test("0.7.2 覆盖到 0.7.5、迁移和回滚均保留数据与兼容扩展路径", {
   timeout: 120_000

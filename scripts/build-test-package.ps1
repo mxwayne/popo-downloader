@@ -6,6 +6,8 @@ param(
   [string]$SigningKeyBase64 = $env:POPO_RELEASE_SIGNING_KEY_BASE64,
   [ValidateSet('Stable', 'Dev')]
   [string]$Channel = 'Stable',
+  # Clients hard-code this repository as the GitHub backup update source; the manifest URL must point to it.
+  [string]$GitHubRepository = 'mxwayne/popo-downloader',
   [switch]$SkipRuntimeBuild
 )
 
@@ -46,6 +48,8 @@ $stagingRoot = Join-Path $distRoot $packageName
 $zipPath = Join-Path $distRoot "$packageName.zip"
 $checksumPath = "$zipPath.sha256.txt"
 $channelManifestPath = if ($isDev) { '' } else { Join-Path $distRoot 'latest.json' }
+# GitHub backup manifest: same version and ZIP, only the URL differs, signed separately (the signature covers the URL).
+$githubManifestPath = if ($isDev) { '' } else { Join-Path $distRoot 'latest.github.json' }
 $bootstrapperPath = Join-Path $distRoot "$packageName.exe"
 $bootstrapperChecksumPath = "$bootstrapperPath.sha256.txt"
 $updateBaseUrl = 'https://popo-updates-1461466196.cos.ap-guangzhou.myqcloud.com/stable'
@@ -267,17 +271,20 @@ $artifactName = [System.IO.Path]::GetFileName($zipPath)
 if (-not $isDev) {
   $publishedAt = [DateTimeOffset]::Now.ToString('o')
   $downloadUrl = "$updateBaseUrl/$artifactName"
-  $canonical = @(
-  '1',
-  'stable',
-  $versionName,
-  [string]$manifest.version,
-  $publishedAt,
-  $artifactName,
-  $downloadUrl,
-  $hash,
-  [string]$size
-) -join "`n"
+  $githubDownloadUrl = "https://github.com/$GitHubRepository/releases/download/v$versionName/$artifactName"
+  function Get-ManifestCanonical([string]$url) {
+    return @(
+      '1',
+      'stable',
+      $versionName,
+      [string]$manifest.version,
+      $publishedAt,
+      $artifactName,
+      $url,
+      $hash,
+      [string]$size
+    ) -join "`n"
+  }
 
   $privateKeyBytes = $null
   if ($SigningKeyBase64) {
@@ -304,7 +311,11 @@ if (-not $isDev) {
   try {
   $rsa.FromXmlString([System.Text.Encoding]::UTF8.GetString($privateKeyBytes))
   $signature = [Convert]::ToBase64String($rsa.SignData(
-    [System.Text.Encoding]::UTF8.GetBytes($canonical),
+    [System.Text.Encoding]::UTF8.GetBytes((Get-ManifestCanonical $downloadUrl)),
+    [System.Security.Cryptography.CryptoConfig]::MapNameToOID('SHA256')
+  ))
+  $githubSignature = [Convert]::ToBase64String($rsa.SignData(
+    [System.Text.Encoding]::UTF8.GetBytes((Get-ManifestCanonical $githubDownloadUrl)),
     [System.Security.Cryptography.CryptoConfig]::MapNameToOID('SHA256')
   ))
   }
@@ -320,24 +331,31 @@ if (-not $isDev) {
   if (-not $releaseNotes) { throw 'Release notes must not be empty.' }
   }
 
-  $channelManifest = [ordered]@{
-  schemaVersion = 1
-  channel = 'stable'
-  version = $versionName
-  chromeVersion = [string]$manifest.version
-  publishedAt = $publishedAt
-  artifact = $artifactName
-  url = $downloadUrl
-  sha256 = $hash
-  size = $size
-  signature = $signature
-  notes = $releaseNotes
+  function New-ChannelManifest([string]$url, [string]$manifestSignature) {
+    return [ordered]@{
+      schemaVersion = 1
+      channel = 'stable'
+      version = $versionName
+      chromeVersion = [string]$manifest.version
+      publishedAt = $publishedAt
+      artifact = $artifactName
+      url = $url
+      sha256 = $hash
+      size = $size
+      signature = $manifestSignature
+      notes = $releaseNotes
+    }
   }
-  $channelJson = $channelManifest | ConvertTo-Json -Depth 5
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
   [System.IO.File]::WriteAllText(
     $channelManifestPath,
-    $channelJson,
-    (New-Object System.Text.UTF8Encoding($false))
+    ((New-ChannelManifest $downloadUrl $signature) | ConvertTo-Json -Depth 5),
+    $utf8NoBom
+  )
+  [System.IO.File]::WriteAllText(
+    $githubManifestPath,
+    ((New-ChannelManifest $githubDownloadUrl $githubSignature) | ConvertTo-Json -Depth 5),
+    $utf8NoBom
   )
 }
 

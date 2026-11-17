@@ -268,7 +268,8 @@ jobs:
             "$($builtManifest.artifact).sha256.txt",
             $expectedBootstrapper,
             "$expectedBootstrapper.sha256.txt",
-            'latest.json'
+            'latest.json',
+            'latest.github.json'
           )
 
           $releaseJson = gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json isDraft,assets 2>$null
@@ -284,7 +285,7 @@ jobs:
                 gh release delete-asset $env:RELEASE_TAG $asset --repo $env:GITHUB_REPOSITORY --yes
                 if ($LASTEXITCODE -ne 0) { throw "Failed to reset the incomplete draft GitHub Release asset: $asset" }
               }
-              gh release upload $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY "$dist/$($builtManifest.artifact)" "$dist/$($builtManifest.artifact).sha256.txt" "$dist/$expectedBootstrapper" "$dist/$expectedBootstrapper.sha256.txt" "$dist/latest.json"
+              gh release upload $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY "$dist/$($builtManifest.artifact)" "$dist/$($builtManifest.artifact).sha256.txt" "$dist/$expectedBootstrapper" "$dist/$expectedBootstrapper.sha256.txt" "$dist/latest.json" "$dist/latest.github.json"
               if ($LASTEXITCODE -ne 0) { throw 'Failed to recover the draft GitHub Release assets.' }
             }
             foreach ($asset in $expectedAssets) {
@@ -296,7 +297,7 @@ jobs:
           else {
             gh release create $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --draft --verify-tag --title "POPO $($builtManifest.version)" --notes-file release-notes.md
             if ($LASTEXITCODE -ne 0) { throw 'Failed to create the draft GitHub Release.' }
-            gh release upload $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY "$dist/$($builtManifest.artifact)" "$dist/$($builtManifest.artifact).sha256.txt" "$dist/$expectedBootstrapper" "$dist/$expectedBootstrapper.sha256.txt" "$dist/latest.json"
+            gh release upload $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY "$dist/$($builtManifest.artifact)" "$dist/$($builtManifest.artifact).sha256.txt" "$dist/$expectedBootstrapper" "$dist/$expectedBootstrapper.sha256.txt" "$dist/latest.json" "$dist/latest.github.json"
             if ($LASTEXITCODE -ne 0) { throw 'Failed to upload the draft GitHub Release assets.' }
             $releaseIsDraft = $true
           }

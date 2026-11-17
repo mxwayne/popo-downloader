@@ -471,3 +471,32 @@ test("完成凭证生成完成提示：带扫描方式与用时，缺计时数�
   assert.equal(uiModel.jobTimingLabel({ id: "x", status: "complete", startedAt: receipt.startedAt, scanCompletedAt: receipt.scanCompletedAt, completedAt: receipt.completedAt, scanVia: "mixed" }),
     "扫描用时 4 秒（接口+页面） · 下载用时 1 分 3 秒");
 });
+
+test("更新失败提示：按原因给出可操作的指引，并总是带 GitHub 手动升级入口", () => {
+  const { updateFailureGuidance, GITHUB_RELEASES_URL } = uiModel;
+  assert.equal(GITHUB_RELEASES_URL, "https://github.com/mxwayne/popo-downloader/releases/latest");
+  assert.equal(updateFailureGuidance({ state: "up_to_date", message: "" }), null);
+  assert.equal(updateFailureGuidance(null), null);
+
+  const setup = updateFailureGuidance({ state: "failed", message: "The verified setup process failed with exit code 1." });
+  assert.match(setup.title, /安装程序没有完成/);
+  assert.match(setup.hint, /退出 Gopeed/);
+  assert.equal(setup.detail, "The verified setup process failed with exit code 1.");
+
+  const network = updateFailureGuidance({ state: "failed", message: "The remote name could not be resolved: 'popo-updates.cos.myqcloud.com'" });
+  assert.match(network.title, /无法连接更新服务/);
+  assert.match(network.hint, /代理/);
+
+  const host = updateFailureGuidance({ state: "failed", message: "Specified native messaging host not found." });
+  assert.match(host.title, /本机助手/);
+
+  const signature = updateFailureGuidance({ state: "failed", message: "The update metadata signature is invalid." });
+  assert.match(signature.title, /校验/);
+  assert.match(signature.hint, /已拒绝安装/);
+
+  const unknown = updateFailureGuidance({ state: "failed", message: "" });
+  assert.match(unknown.title, /自动更新失败/);
+  for (const guidance of [setup, network, host, signature, unknown]) {
+    assert.match(guidance.hint + guidance.title, /./);
+  }
+});
