@@ -378,8 +378,9 @@ test("任务成功完成后列表里没有任务，页面仍通过完成凭证�
   await page.evaluate(() => {
     window.__popoUiTest.state.folderReceipts.push({
       key: "k1", parentUrl: "https://example.test/team/pc/test/pageDetail/folder", folderItemIndex: "0", folderName: "马车鉴赏",
-      completedAt: new Date().toISOString(), startedAt: new Date(Date.now() - 67000).toISOString(),
-      scanCompletedAt: new Date(Date.now() - 63000).toISOString(), scanVia: "api", counts: { files: 32, success: 32 }
+      // 固定时间戳：用时文案不依赖取值的毫秒，避免在慢机器上因下取整偶尔差 1 秒。
+      completedAt: "2026-11-17T10:01:07.000Z", startedAt: "2026-11-17T10:00:00.000Z",
+      scanCompletedAt: "2026-11-17T10:00:04.000Z", scanVia: "api", counts: { files: 32, success: 32 }
     });
   });
   const toast = page.locator(".popo-toast");
