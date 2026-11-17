@@ -1,5 +1,16 @@
 # POPO repository working agreements
 
+## 源码导航
+
+Chrome MV3 + TypeScript + React + Gopeed。依赖版本以 package-lock.json 为准。
+
+- 根目录 background.js：队列、扫描、交付与恢复；content.js/page-api.js：POPO 页面读取；core.js/queue.js/gopeed.js：纯规则与引擎适配。
+- src/：运行包、存储与 UI，见 src/AGENTS.md。
+- tests/：Node 与 Playwright 隔离回归；scripts/：构建、固定 Dev 同步和 Windows 验证。
+- native-host/、agent/、setup/、bootstrapper/：Windows 本机组件。
+- docs/specs/、docs/plans/、docs/tasks/、docs/verification/：当前开发需求、实施任务与验收证据。
+- assets/、vendor/：图标与固定上游源码；runtime/、dist/、output/：生成或本地验证产物。
+
 ## Extension development and test boundary
 
 - The Git working tree is the only source of truth for Extension code.

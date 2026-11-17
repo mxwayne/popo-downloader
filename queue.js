@@ -1,3 +1,9 @@
+/**
+ * [INPUT]: 接收任务状态、文件摘要与恢复关联。
+ * [OUTPUT]: 导出排队、取消、汇总与可见任务规则。
+ * [POS]: 后台与页面共享的纯队列规则，不执行存储和传输。
+ * [PROTOCOL]: Update this header on change, then check AGENTS.md
+ */
 (function initPopoQueue(root, factory) {
   const api = factory(root);
   if (typeof module === "object" && module.exports) module.exports = api;
@@ -147,6 +153,8 @@
 
       return !list.some((candidate, candidateIndex) => {
         if (candidate === job) return false;
+        if (job.retryOfJobId === candidate.id || job.restoreOfJobId === candidate.id) return false;
+        if (candidate.retryOfJobId === job.id && candidate.status === "cancelled") return false;
         if (candidate.retryOfJobId === job.id) return true;
         if (!job.key || candidate.key !== job.key) return false;
         const jobTime = Date.parse(job.createdAt || "");
@@ -154,6 +162,7 @@
         if (Number.isFinite(jobTime) && Number.isFinite(candidateTime) && candidateTime !== jobTime) {
           return candidateTime > jobTime;
         }
+        if (Number.isFinite(jobTime) && !Number.isFinite(candidateTime)) return false;
         return candidateIndex > index;
       });
     });

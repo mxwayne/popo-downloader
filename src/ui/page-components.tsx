@@ -58,6 +58,7 @@ import {
 } from "../ui-model";
 
 import { useUiActions } from "./actions";
+import { JobTiming, TaskDetails } from "./task-details";
 export interface FolderItem {
   name: string;
   itemIndex: string;
@@ -1085,6 +1086,14 @@ export function QueueDock({
             </div>
           )}
           {primary.status !== "queued" && <ProgressBar job={primary} />}
+          <JobTiming job={primary} />
+          <TaskDetails
+            job={primary}
+            busy={busy}
+            onRetry={(failureId) =>
+              void run({ type: "RETRY_JOB_ITEM", jobId: primary.id, failureId })
+            }
+          />
           {otherQueuedCount > 0 && (
             <div className="popo-page-queue-more">
               另有 {otherQueuedCount} 个排队

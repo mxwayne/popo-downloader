@@ -526,3 +526,17 @@ test("普通中英文文件名不会发生无意义变化", () => {
     }, settings, []), `POPO稳定下载/普通目录/${name}`);
   }
 });
+
+test("扫描按虚拟列表行号去重，上一层目录的残留行被新目录的同号行替换", () => {
+  const { collectScannedRow } = require("../core.js");
+  const rows = new Map();
+  collectScannedRow(rows, { type: "folder", itemIndex: "0", name: "劫妹" });
+  collectScannedRow(rows, { type: "file", itemIndex: "0", name: "icon_a.png" });
+  collectScannedRow(rows, { type: "file", itemIndex: "1", name: "icon_b.png" });
+  collectScannedRow(rows, { type: "file", itemIndex: "1", name: "icon_b.png" });
+  assert.deepEqual(Array.from(rows.values()).map((item) => item.name), ["icon_a.png", "icon_b.png"]);
+  const unindexed = new Map();
+  collectScannedRow(unindexed, { type: "file", itemIndex: "", name: "a.png" });
+  collectScannedRow(unindexed, { type: "file", itemIndex: "", name: "b.png" });
+  assert.equal(unindexed.size, 2);
+});

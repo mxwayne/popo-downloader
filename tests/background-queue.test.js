@@ -79,6 +79,9 @@ function createHarness(initial = {}, options = {}) {
         ...(options.listGopeedTasks ? {
           listTasks: options.listGopeedTasks
         } : {}),
+        ...(options.startOrReplaceGopeedTask ? {
+          startOrReplaceTask: options.startOrReplaceGopeedTask
+        } : {}),
         ...(options.getGopeedTask ? {
           getTask: options.getGopeedTask
         } : {}),
@@ -169,7 +172,7 @@ function createHarness(initial = {}, options = {}) {
         }
         return { ok: true };
       },
-      async get() { return null; },
+      async get(tabId) { return options.getTab ? options.getTab(tabId) : null; },
       async remove() {}
     }
   };
@@ -1922,6 +1925,150 @@ test("同一 URL 的多层子目录按完整路径扫描且不会合并同名文
   }
 });
 
+test("目录短暂读取失败自动重扫，耗尽后保留定位且继续队列", async () => {
+  const rootUrl = "https://docs.popo.netease.com/team/pc/team1/pageDetail/root1";
+  const state = transferState({ mode: "scanning", jobStatus: "scanning" });
+  state.items = [];
+  state.triggerMode = "folder_button";
+  state.workerReadyUrl = rootUrl;
+  state.activeTransfers = [];
+  state.scanQueue = [{ url: rootUrl, path: ["素材"] }];
+  let attempts = 0;
+  let sendRuntimeMessage;
+  const harness = createHarness({ popoState: state, popoSettings: state.settings }, {
+    async sendTabMessage(_tabId, message) {
+      if (message.type === "NAVIGATE_WORKER") {
+        setTimeout(() => void sendRuntimeMessage(
+          { type: "REGISTER_WORKER_FRAME", url: message.url },
+          { tab: { id: 7, url: message.url }, url: message.url, frameId: 42 }
+        ), 0);
+      }
+      if (message.type === "SCAN_DIRECTORY") {
+        attempts += 1;
+        return { ok: false, error: "目录加载超时" };
+      }
+      if (message.type === "PING") return { ok: true, result: { url: rootUrl } };
+      return { ok: true, result: {} };
+    }
+  });
+  sendRuntimeMessage = harness.send;
+  try {
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      harness.fireAlarm("popo-stable-downloader-pump");
+      await waitUntil(() => attempts >= attempt);
+      await waitUntil(() => attempt < 3
+        ? harness.stored.popoState.scanQueue[0]?.scanRetries === attempt
+        : harness.stored.popoState.scanFailures.length === 1);
+      assert.equal(harness.stored.popoState.scanFailures.length, attempt < 3 ? 0 : 1);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const response = await harness.send({ type: "GET_STATE" });
+    assert.equal(response.state.jobs[0].failureEntries[0].kind, "directory");
+    assert.deepEqual(response.state.jobs[0].failureEntries[0].path, ["素材"]);
+    assert.equal(attempts, 3);
+  } finally { harness.cleanup(); }
+});
+
+test("单项文件重试只读父目录，保留其他失败并拒绝伪造条目", async () => {
+  const rootUrl = "https://docs.popo.netease.com/team/pc/team1/pageDetail/root1";
+  const id = encodeURIComponent(`${rootUrl}\u0000素材\u00001\u0000a.png`);
+  const failures = [
+    { id, kind: "file", name: "a.png", path: ["素材"], retryKey: "key-a", url: rootUrl, rootUrl, route: [] },
+    { id: "file-b", kind: "file", name: "b.png", path: ["素材"], retryKey: "key-b", url: rootUrl, rootUrl, route: [] }
+  ];
+  const source = { id: "source", key: "source-key", status: "failed", sourceTabId: 7,
+    folderName: "素材", parentUrl: rootUrl, folderItemIndex: "1",
+    counts: { files: 68, success: 66, failed: 2 }, failureEntries: failures, failureRetryKeys: ["key-a", "key-b"] };
+  const harness = createHarness({ popoState: { version: 4, jobs: [source], mode: "idle" } });
+  try {
+    const invalid = await harness.send({ type: "RETRY_JOB_ITEM", jobId: "source", failureId: "fake" });
+    assert.equal(invalid.ok, false);
+    assert.equal(harness.stored.popoState.jobs.length, 1);
+    const response = await harness.send({ type: "RETRY_JOB_ITEM", jobId: "source", failureId: id });
+    assert.equal(response.ok, true, response.error);
+    const retry = response.state.jobs.find((job) => job.retryOfJobId === "source");
+    assert.equal(retry.retainedCounts.success, 66);
+    assert.deepEqual(retry.retainedFailures, [failures[1]]);
+    assert.equal(retry.retrySelection.id, id);
+    assert.equal(harness.stored.popoState.resolveQueue.length, 0);
+    assert.deepEqual(harness.stored.popoState.scanQueue[0].path, ["素材"]);
+    await harness.send({ type: "RETRY_JOB_ITEM", jobId: "source", failureId: id });
+    assert.equal(harness.stored.popoState.jobs.length, 2);
+  } finally { harness.cleanup(); }
+});
+
+test("单项目录补下不受原任务失败文件筛选限制", async () => {
+  const rootUrl = "https://docs.popo.netease.com/team/pc/team1/pageDetail/root1";
+  const failure = { id: "dir-1", kind: "directory", name: "子目录", path: ["素材", "子目录"],
+    url: rootUrl, rootUrl, route: [{ name: "子目录", itemIndex: "2" }] };
+  const source = { id: "source-dir", key: "source-dir-key", status: "failed", sourceTabId: 7,
+    folderName: "素材", parentUrl: rootUrl, folderItemIndex: "1",
+    counts: { files: 2, success: 1, failed: 1, scanFailures: 1 },
+    failureEntries: [failure], failureRetryKeys: ["failed-file-outside-directory"] };
+  const harness = createHarness({ popoState: { version: 4, jobs: [source], mode: "idle" } });
+  try {
+    const response = await harness.send({ type: "RETRY_JOB_ITEM", jobId: source.id, failureId: failure.id });
+    assert.equal(response.ok, true, response.error);
+    const job = response.state.jobs.find((entry) => entry.retryOfJobId === source.id);
+    assert.deepEqual(job.retryKeys, []);
+    assert.deepEqual(harness.stored.popoState.scanQueue[0].route, failure.route);
+  } finally { harness.cleanup(); }
+});
+
+for (const missing of [false, true]) {
+  test(`单项补下实际扫描只选择目标文件，目标${missing ? "消失仍保留失败" : "存在时不进入兄弟目录"}`, async () => {
+    const rootUrl = "https://docs.popo.netease.com/team/pc/team1/pageDetail/root1";
+    const id = encodeURIComponent(`${rootUrl}\u0000素材\u00001\u0000a.png`);
+    const target = { id, kind: "file", name: "a.png", path: ["素材"], retryKey: "key-a", url: rootUrl, rootUrl, route: [] };
+    const other = { ...target, id: "file-b", name: "b.png", retryKey: "key-b" };
+    const source = { id: "scan-source", key: "scan-source-key", status: "failed", sourceTabId: 7,
+      folderName: "素材", parentUrl: rootUrl, folderItemIndex: "1",
+      counts: { files: 68, success: 66, failed: 2 }, failureEntries: [target, other], failureRetryKeys: ["key-a", "key-b"] };
+    let send;
+    const harness = createHarness({ popoState: { version: 4, jobs: [source], mode: "idle" } }, {
+      async sendTabMessage(_tabId, message) {
+        if (message.type === "NAVIGATE_WORKER") setTimeout(() => void send(
+          { type: "REGISTER_WORKER_FRAME", url: message.url },
+          { tab: { id: 7, url: message.url }, url: message.url, frameId: 42 }
+        ), 0);
+        if (message.type === "PING") return { ok: true, result: { url: rootUrl, directoryName: "素材" } };
+        if (message.type === "SCAN_DIRECTORY") {
+          const items = [
+            ...(!missing ? [{ name: "a.png", itemIndex: "1", type: "file" }] : []),
+            { name: "b.png", itemIndex: "2", type: "file" }, { name: "兄弟目录", itemIndex: "3", type: "folder" }
+          ];
+          return { ok: true, result: { url: rootUrl, directoryName: "素材", items, diagnostics: { expectedItemCount: items.length } } };
+        }
+        return { ok: true, result: {} };
+      }
+    });
+    send = harness.send;
+    try {
+      const result = await send({ type: "RETRY_JOB_ITEM", jobId: source.id, failureId: id });
+      assert.equal(result.ok, true, result.error);
+      const retryId = harness.stored.popoState.activeJobId;
+      await send({ type: "REGISTER_WORKER_FRAME", url: rootUrl },
+        { tab: { id: 7, url: rootUrl }, url: rootUrl, frameId: 42 });
+      harness.fireAlarm("popo-stable-downloader-pump");
+      await waitUntil(() => harness.stored.popoState.itemChunkCount > 0);
+      const items = Object.entries(harness.stored).filter(([key]) => key.startsWith(`popoItems:${retryId}:`)).flatMap(([, entries]) => entries);
+      assert.deepEqual(items.filter((item) => item.selected).map((item) => item.name), missing ? [] : ["a.png"]);
+      assert.deepEqual(harness.stored.popoState.resolveQueue, []);
+      assert.equal(harness.stored.popoState.jobs.find((job) => job.id === retryId).counts.success, 66);
+      if (missing) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        harness.fireAlarm("popo-stable-downloader-pump");
+        await waitUntil(() => harness.stored.popoState.jobs.find((job) => job.id === retryId).status === "failed");
+        const failed = (await send({ type: "GET_STATE" })).state.jobs.find((job) => job.id === retryId);
+        assert.ok(failed, JSON.stringify(harness.stored.popoState.jobs.map((job) => ({ id: job.id, status: job.status, retryOfJobId: job.retryOfJobId, createdAt: job.createdAt }))));
+        assert.equal(failed.failureEntries.length, 2);
+        assert.equal(failed.counts.failed, 2);
+        assert.match(failed.failureEntries.find((entry) => entry.id === id).error, /未找到/);
+      }
+    } finally { harness.cleanup(); }
+  });
+}
+
 test("遗漏目录可以重扫整个文件夹而不要求先有失败文件", async () => {
   const rootUrl = "https://docs.popo.netease.com/team/pc/team1/pageDetail/root1";
   const now = new Date().toISOString();
@@ -2242,6 +2389,9 @@ test("单独文件夹全部成功且数量闭环后写入持久化绿色凭证",
     folderName: job.folderName
   });
   job.scope = "folder";
+  job.startedAt = "2026-11-17T10:00:00.000Z";
+  job.scanCompletedAt = "2026-11-17T10:00:04.000Z";
+  job.scanVia = "api";
   state.items = [{
     id: "completed-file",
     parentUrl: job.parentUrl,
@@ -2278,6 +2428,11 @@ test("单独文件夹全部成功且数量闭环后写入持久化绿色凭证",
       verifiedDirectories: 0,
       unverifiedDirectories: 0
     });
+    // 任务结束后从列表消失，用时与扫描方式随凭证保留，页面据此给出完成提示。
+    const receipt = harness.stored.popoState.folderReceipts[0];
+    assert.equal(receipt.startedAt, "2026-11-17T10:00:00.000Z");
+    assert.equal(receipt.scanCompletedAt, "2026-11-17T10:00:04.000Z");
+    assert.equal(receipt.scanVia, "api");
     const snapshot = await harness.send({ type: "GET_STATE" });
     assert.equal(snapshot.state.jobs.length, 0);
     assert.equal(snapshot.state.folderReceipts[0].folderName, job.folderName);
@@ -2471,6 +2626,956 @@ test("本机去重核对多次失败时停止该文件并保留重试，避免�
     harness.cleanup();
   }
 });
+
+test("目录扫描完成后任务带目录汇总（预计、实际、核对状态）", async () => {
+  const state = transferState({ mode: "scanning", jobStatus: "scanning" });
+  state.items = [];
+  state.triggerMode = "folder_button";
+  state.workerReadyUrl = state.rootUrl;
+  state.activeTransfers = [];
+  state.activeItemId = null;
+  state.scanQueue = [{ url: state.rootUrl, path: ["素材"] }];
+  let send;
+  const harness = createHarness(
+    { popoSettings: state.settings, popoState: state },
+    {
+      async sendTabMessage(_tabId, message) {
+        if (message.type === "NAVIGATE_WORKER") setTimeout(() => void send(
+          { type: "REGISTER_WORKER_FRAME", url: message.url },
+          { tab: { id: 7, url: message.url }, url: message.url, frameId: 42 }
+        ), 0);
+        if (message.type === "PING") return { ok: true, result: { url: state.rootUrl, directoryName: "素材" } };
+        if (message.type === "SCAN_DIRECTORY") {
+          const items = [{ name: "a.png", itemIndex: "0", type: "file" }, { name: "b.png", itemIndex: "1", type: "file" }];
+          return { ok: true, result: { url: state.rootUrl, directoryName: "素材", items, diagnostics: { expectedItemCount: 2 } } };
+        }
+        return { ok: true, result: {} };
+      }
+    }
+  );
+  send = harness.send;
+  try {
+    harness.fireAlarm("popo-stable-downloader-pump");
+    await waitUntil(() => harness.stored.popoState?.directoryScans?.length === 1);
+    const snapshot = await harness.send({ type: "GET_STATE" });
+    const directory = snapshot.state.jobs[0].directories[0];
+    assert.deepEqual(
+      { path: directory.path, expected: directory.expected, found: directory.found, status: directory.status },
+      { path: ["素材"], expected: 2, found: 2, status: "verified" }
+    );
+  } finally {
+    harness.cleanup();
+  }
+});
+
+function failingJobState({ reason = "operation_failed", autoRetryRound, withBatchPeer = false } = {}) {
+  const state = transferState();
+  const rootUrl = state.rootUrl;
+  state.items = [{
+    id: "failed-file", name: "x.png", itemIndex: "1", selected: true, status: "failed",
+    failureStage: "目录加载失败", error: "超时", failureReason: reason, attempts: 3,
+    directoryPath: ["素材"], parentUrl: rootUrl, rootUrl, directoryRoute: []
+  }];
+  state.activeTransfers = [];
+  state.activeItemId = null;
+  state.jobs[0].scope = "folder";
+  if (autoRetryRound) {
+    state.jobs[0].autoRetryRound = autoRetryRound;
+    state.jobs[0].retryOfJobId = "original-job";
+  }
+  if (withBatchPeer) {
+    state.jobs[0].batchId = "batch-1";
+    state.jobs.push({
+      id: "peer-job", key: "peer-key", sourceTabId: 7, folderName: "另一个", folderItemIndex: "5",
+      parentUrl: rootUrl, status: "queued", batchId: "batch-1", cancelRequested: false,
+      createdAt: new Date(Date.now() + 1000).toISOString(), counts: {}
+    });
+  }
+  return state;
+}
+
+async function runUntilJobFinished(state) {
+  const harness = createHarness(
+    { popoSettings: state.settings, popoState: state },
+    { gopeedConfig: { downloadDir: "D:\\Downloads" }, gopeedTasks: [] }
+  );
+  harness.fireAlarm("popo-stable-downloader-pump");
+  // 全量并行运行时 400ms 的默认等待偶尔不够，这里放宽到 4 秒。
+  const sourceStatus = () => harness.stored.popoState?.jobs?.find((job) => job.id === "job-gopeed-control")?.status;
+  for (let round = 0; round < 800 && sourceStatus() !== "failed"; round += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(sourceStatus(), "failed");
+  return harness;
+}
+
+test("失败明细最多保存 200 项，其余只记数量，批量重试键不受限", async () => {
+  const state = failingJobState({ reason: "permission_denied" });
+  const template = state.items[0];
+  state.items = Array.from({ length: 250 }, (_, index) => ({
+    ...template, id: `failed-${index}`, name: `f${index}.png`, itemIndex: String(index)
+  }));
+  const harness = await runUntilJobFinished(state);
+  try {
+    const job = harness.stored.popoState.jobs.find((entry) => entry.id === "job-gopeed-control");
+    assert.equal(job.failureEntries.length, 200);
+    assert.equal(job.failureEntriesOmitted, 50);
+    assert.equal(job.failureRetryKeys.length, 250);
+  } finally { harness.cleanup(); }
+});
+
+test("任务失败结束后自动补一轮，并记录事件", async () => {
+  const harness = await runUntilJobFinished(failingJobState());
+  try {
+    const jobs = harness.stored.popoState.jobs;
+    const retry = jobs.find((job) => job.retryOfJobId === "job-gopeed-control");
+    assert.ok(retry, JSON.stringify(jobs.map((job) => [job.id, job.status])));
+    assert.equal(retry.autoRetryRound, 1);
+    assert.ok(["queued", "scanning", "waiting_worker", "starting"].includes(retry.status));
+    assert.ok(harness.stored.popoState.logs.some((entry) => entry.code === "AUTO_RETRY_QUEUED"));
+  } finally { harness.cleanup(); }
+});
+
+test("权限类失败不自动补", async () => {
+  const harness = await runUntilJobFinished(failingJobState({ reason: "permission_denied" }));
+  try {
+    assert.equal(harness.stored.popoState.jobs.length, 1);
+  } finally { harness.cleanup(); }
+});
+
+test("自动补下的任务自己失败后不再自动补", async () => {
+  const harness = await runUntilJobFinished(failingJobState({ autoRetryRound: 1 }));
+  try {
+    assert.equal(harness.stored.popoState.jobs.length, 1);
+  } finally { harness.cleanup(); }
+});
+
+test("用户手动发起的补下失败后不再自动补", async () => {
+  const state = failingJobState();
+  state.jobs[0].retryOfJobId = "original-job";
+  const harness = await runUntilJobFinished(state);
+  try {
+    assert.equal(harness.stored.popoState.jobs.length, 1);
+  } finally { harness.cleanup(); }
+});
+
+test("批量任务中自动补下排在同批后续任务之后，不阻塞它们", async () => {
+  const harness = await runUntilJobFinished(failingJobState({ withBatchPeer: true }));
+  try {
+    const state = harness.stored.popoState;
+    assert.equal(state.activeJobId, "peer-job");
+    assert.ok(state.jobs.some((job) => job.retryOfJobId === "job-gopeed-control" && job.autoRetryRound === 1));
+  } finally { harness.cleanup(); }
+});
+
+test("连续 3 次准备失败后冷却，触发冷却的失败不消耗文件重试次数", async () => {
+  const state = transferState({ includePending: true });
+  const first = state.items.find((item) => item.id === "pending-file");
+  first.directoryPath = [state.selectedFolderName];
+  state.items = ["p1", "p2", "p3", "p4"].map((name, index) => ({
+    ...first, id: `${name}-file`, name: `${name}.mp4`, itemIndex: String(index + 1)
+  }));
+  state.triggerMode = "folder_button";
+  state.workerReadyUrl = state.rootUrl;
+  state.activeTransfers = [];
+  state.activeItemId = null;
+  state.jobs[0].counts = { files: 4 };
+  const opened = [];
+  let send;
+  const harness = createHarness(
+    { popoSettings: state.settings, popoState: state },
+    {
+      gopeedConfig: { downloadDir: "D:\\Downloads" },
+      gopeedTasks: [],
+      async sendTabMessage(_tabId, message) {
+        if (message.type === "NAVIGATE_WORKER") setTimeout(() => void send(
+          { type: "REGISTER_WORKER_FRAME", url: message.url },
+          { tab: { id: 7, url: message.url }, url: message.url, frameId: 42 }
+        ), 0);
+        if (message.type === "PING") return { ok: true, result: { url: state.rootUrl } };
+        if (message.type === "OPEN_ITEM") { opened.push(message.name); return { ok: false, error: "目录加载超时" }; }
+        return { ok: true, result: {} };
+      }
+    }
+  );
+  send = harness.send;
+  try {
+    for (let round = 1; round <= 3; round += 1) {
+      harness.fireAlarm("popo-stable-downloader-pump");
+      await waitUntil(() => opened.length === round);
+      await waitUntil(() => !harness.stored.popoState.preparingItemId);
+    }
+    assert.ok(harness.stored.popoState.prepareCooldownUntil > Date.now(), "第 3 次失败后必须进入冷却");
+    const third = harness.stored["popoItems:job-gopeed-control:0"].find((item) => item.name === "p3.mp4");
+    assert.equal(third.attempts, 0, "触发冷却的失败不消耗重试次数");
+    assert.equal(third.status, "pending");
+    harness.fireAlarm("popo-stable-downloader-pump");
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(opened.length, 3, "冷却期内不得再准备任何文件");
+  } finally {
+    harness.cleanup();
+  }
+});
+
+function sameDirectoryHarness({ returnDirectoryName, firstFileFails = false } = {}) {
+  const state = transferState({ includePending: true });
+  const first = state.items.find((item) => item.id === "pending-file");
+  Object.assign(first, { directoryPath: [state.selectedFolderName], rootUrl: state.rootUrl, directoryRoute: [] });
+  state.items = ["a", "b"].map((name, index) => ({
+    ...first, id: `${name}-file`, name: `${name}.mp4`, itemIndex: String(index + 1)
+  }));
+  state.settings = { ...state.settings, concurrency: 5 };
+  state.triggerMode = "folder_button";
+  state.workerReadyUrl = state.rootUrl;
+  state.teamSpaceId = "space-real";
+  state.activeTransfers = [];
+  state.activeItemId = null;
+  state.gopeedConnected = true;
+  state.gopeedDownloadDir = "D:\\Downloads";
+  state.jobs[0].counts = { files: 2 };
+  const calls = [];
+  const tab = { url: "https://docs.popo.netease.com/team/pc/team1/pageDetail/root1" };
+  let currentUrl = state.rootUrl;
+  let openCount = 0;
+  let send;
+  const harness = createHarness(
+    { popoSettings: state.settings, popoState: state },
+    {
+      getTab: async (tabId) => ({ id: tabId, url: tab.url }),
+      gopeedConfig: { downloadDir: "D:\\Downloads" },
+      async getGopeedTask(_settings, taskId) {
+        return { id: taskId, status: "running", progress: { downloaded: 1, speed: 1 }, meta: { req: { labels: {} } } };
+      },
+      gopeedTasks: [1, 2].map((n) => ({
+        id: `task-${n}`, status: "running", progress: { downloaded: n, speed: 1 }, meta: { req: { labels: {} } }
+      })),
+      async startOrReplaceGopeedTask() { return { taskId: `task-${openCount}`, replacedMissingTask: false }; },
+      async sendTabMessage(_tabId, message) {
+        calls.push(message.type);
+        if (message.type === "NAVIGATE_WORKER") {
+          currentUrl = message.url;
+          setTimeout(() => void send(
+            { type: "REGISTER_WORKER_FRAME", url: message.url },
+            { tab: { id: 7, url: message.url }, url: message.url, frameId: 42 }
+          ), 0);
+        }
+        if (message.type === "RETURN_TO_DIRECTORY") currentUrl = state.rootUrl;
+        if (message.type === "PING") {
+          const atDirectory = currentUrl === state.rootUrl;
+          return { ok: true, result: {
+            url: currentUrl,
+            directoryName: atDirectory ? (returnDirectoryName ?? state.selectedFolderName) : ""
+          } };
+        }
+        if (message.type === "OPEN_ITEM") {
+          openCount += 1;
+          currentUrl = `https://docs.popo.netease.com/team/pc/team1/pageDetail/file${openCount}`;
+          return { ok: true, result: { clicked: true } };
+        }
+        if (message.type === "GET_PREVIEW_INFO") {
+          if (firstFileFails && openCount === 1) return { ok: false, error: "预览读取失败" };
+          return { ok: true, result: {
+            titleCandidates: [`${openCount === 1 ? "a" : "b"}.mp4`],
+            media: [{ src: `https://bucket.s3v2.nie.netease.com/file${openCount}.mp4?sig=1` }],
+            downloadButtonCount: 1, loadingCount: 0, previewElementCount: 1, pageId: `file${openCount}`
+          } };
+        }
+        return { ok: true, result: {} };
+      }
+    }
+  );
+  send = harness.send;
+  const prepared = () => harness.stored["popoItems:job-gopeed-control:0"] || [];
+  return { harness, calls, prepared, tab };
+}
+
+for (const scenario of [
+  { name: "用户在原页面切换目录后不复用目录页，避免返回键带走用户页面", sourceUrlChanges: true, expectNavigations: 2, expectReturn: 0 },
+  { name: "同一目录的下一个文件复用目录页，不重新加载", expectNavigations: 1, expectReturn: 1 },
+  { name: "返回后目录名不符时回退完整加载", returnDirectoryName: "别的目录", expectNavigations: 2, expectReturn: 1 },
+  { name: "上一个文件失败后下一个文件做完整加载", firstFileFails: true, expectNavigations: 2, expectReturn: 0 }
+]) {
+  test(scenario.name, async () => {
+    const { harness, calls, prepared, tab } = sameDirectoryHarness(scenario);
+    try {
+      harness.fireAlarm("popo-stable-downloader-pump");
+      await waitUntil(() => calls.filter((type) => type === "OPEN_ITEM").length === 1);
+      await waitUntil(() => !harness.stored.popoState.preparingItemId);
+      // 第一个文件准备完成后，用户在原页面里切换了目录。
+      if (scenario.sourceUrlChanges) tab.url = "https://docs.popo.netease.com/team/pc/team1/pageDetail/user-moved";
+      // 反复触发 pump，直到第二个文件被打开（第一个文件失败时它要先退避；回退路径要先等满 3 秒目录确认）。
+      for (let round = 0; round < 400 && calls.filter((type) => type === "OPEN_ITEM").length < 2; round += 1) {
+        harness.fireAlarm("popo-stable-downloader-pump");
+        await new Promise((resolve) => setTimeout(resolve, 15));
+      }
+      assert.equal(calls.filter((type) => type === "OPEN_ITEM").length, 2, JSON.stringify({ calls, items: prepared().map((i) => [i.name, i.status, i.stage]) }));
+      assert.equal(calls.filter((type) => type === "NAVIGATE_WORKER").length, scenario.expectNavigations, JSON.stringify(calls));
+      assert.equal(calls.filter((type) => type === "RETURN_TO_DIRECTORY").length, scenario.expectReturn, JSON.stringify(calls));
+      assert.ok(prepared().length === 2);
+    } finally {
+      harness.cleanup();
+    }
+  });
+}
+
+test("页面结构诊断由后台清洗后保存，弹窗可读取，非 POPO 页面来源被拒绝", async () => {
+  const harness = createHarness();
+  try {
+    const hostile = {
+      apis: [{ method: "GET", path: "/api/x/0123456789abcdef0123456789abcdef", status: 200,
+        shape: { "icon_bubble_a.png": "https://bucket.s3v2.nie.netease.com/a.png?sig=1" } }],
+      rows: { attributeNames: ["data-item-index"], hasPageDetailLink: false }
+    };
+    const refused = await harness.send(
+      { type: "PAGE_PROBE_REPORT", report: hostile },
+      { tab: { id: 7, url: "https://evil.example/team/pc/t/pageDetail/x" }, url: "https://evil.example/team/pc/t/pageDetail/x", frameId: 0 }
+    );
+    assert.equal(refused.ok, false);
+    const accepted = await harness.send({ type: "PAGE_PROBE_REPORT", report: hostile });
+    assert.equal(accepted.ok, true, accepted.error);
+    const read = await harness.send({ type: "GET_PAGE_PROBE" }, { url: "chrome-extension://abc/popup.html", frameId: 0 });
+    assert.equal(read.ok, true, read.error);
+    const text = JSON.stringify(read.probe);
+    assert.equal(/icon_bubble|https|0123456789abcdef/.test(text), false, text);
+    assert.equal(read.probe.report.apis[0].path, "/api/x/:id");
+  } finally {
+    harness.cleanup();
+  }
+});
+
+// ── 接口扫描：folderSubList 列目录、按文件 ID 建立条目；任何不确定回退页面扫描。
+const API_ROOT_URL = "https://docs.popo.netease.com/team/pc/team1/pageDetail/root1";
+const apiItem = (overrides) => ({
+  pageId: "x", pageName: "x", pageType: 3, hasChildren: 0, pageSize: 10, pageMajorVersion: 1, ...overrides
+});
+const apiListing = (list, extra = {}) => ({
+  status: 200, data: { pageList: list, more: false, total: list.length, ...extra }
+});
+
+function apiScanHarness({ listings, settings = {}, retrySelection = null, listDelayMs = 0 } = {}) {
+  const state = transferState({ mode: "scanning", jobStatus: "scanning" });
+  state.items = [];
+  state.activeTransfers = [];
+  state.activeItemId = null;
+  state.triggerMode = "folder_button";
+  state.rootUrl = API_ROOT_URL;
+  state.workerReadyUrl = API_ROOT_URL;
+  state.teamSpaceKey = "team1";
+  state.teamSpaceId = "space-real";
+  state.selectedFolderName = "素材包";
+  state.settings = { ...state.settings, ...settings };
+  state.jobs[0].scope = "folder";
+  state.jobs[0].folderName = "素材包";
+  state.jobs[0].folderItemIndex = "1";
+  state.jobs[0].parentUrl = API_ROOT_URL;
+  state.scanQueue = [];
+  state.resolveQueue = [{
+    key: "k", rootUrl: API_ROOT_URL, parentUrl: API_ROOT_URL, parentPath: [], parentRoute: [],
+    name: "素材包", itemIndex: "1"
+  }];
+  if (retrySelection) {
+    state.jobs[0].retrySelection = retrySelection;
+    state.jobs[0].retryOfJobId = "orig";
+    state.resolveQueue = [];
+    state.scanQueue = [{ url: retrySelection.url, path: retrySelection.path, rootUrl: API_ROOT_URL, route: retrySelection.route }];
+  }
+  const calls = [];
+  const dirUrls = {};
+  const listing = { inFlight: 0, max: 0 };
+  let currentUrl = API_ROOT_URL;
+  let send;
+  state.gopeedConnected = true;
+  state.gopeedDownloadDir = "D:\\Downloads";
+  const harness = createHarness({ popoSettings: state.settings, popoState: state }, {
+    gopeedConfig: { downloadDir: "D:\\Downloads" },
+    gopeedTasks: [],
+    async startOrReplaceGopeedTask() { return { taskId: "task-api", replacedMissingTask: false }; },
+    async sendTabMessage(_tabId, message) {
+      calls.push(message.type + (message.type === "LIST_FOLDER" ? `:${message.pageId}` : ""));
+      if (message.type === "NAVIGATE_WORKER") {
+        currentUrl = message.url;
+        setTimeout(() => void send({ type: "REGISTER_WORKER_FRAME", url: message.url },
+          { tab: { id: 7, url: message.url }, url: message.url, frameId: 42 }), 0);
+      }
+      if (message.type === "LIST_FOLDER") {
+        listing.inFlight += 1;
+        listing.max = Math.max(listing.max, listing.inFlight);
+        if (listDelayMs) await new Promise((resolve) => setTimeout(resolve, listDelayMs));
+        listing.inFlight -= 1;
+        const body = listings[message.pageId];
+        return { ok: true, result: body ? { ok: true, status: 200, body } : { ok: false, status: 0, error: "no_template" } };
+      }
+      if (message.type === "PING") {
+        const id = currentUrl.match(/pageDetail\/([a-z0-9]+)/i)?.[1];
+        return { ok: true, result: { url: currentUrl, directoryName: dirUrls[id] || "素材包" } };
+      }
+      if (message.type === "SCAN_DIRECTORY") {
+        const id = currentUrl.match(/pageDetail\/([a-z0-9]+)/i)?.[1];
+        const items = (listings[id]?.data.pageList || []).map((entry, index) => ({
+          name: entry.pageName, itemIndex: String(index), type: entry.pageType === 0 ? "folder" : "file"
+        }));
+        return { ok: true, result: { url: currentUrl, directoryName: dirUrls[id] || "素材包", items,
+          diagnostics: { expectedItemCount: items.length } } };
+      }
+      return { ok: true, result: {} };
+    }
+  });
+  send = harness.send;
+  const items = () => Object.entries(harness.stored)
+    .filter(([key]) => key.startsWith("popoItems:job-gopeed-control:")).flatMap(([, value]) => value);
+  return { harness, calls, dirUrls, items, state, listing };
+}
+
+const standardListings = () => ({
+  root1: apiListing([apiItem({ pageId: "folderA", pageName: "素材包", pageType: 0, hasChildren: 1, pageMajorVersion: 3 }),
+    apiItem({ pageId: "other", pageName: "无关文件.txt" })]),
+  folderA: apiListing([apiItem({ pageId: "x1", pageName: "a.png" }),
+    apiItem({ pageId: "folderB", pageName: "子目录", pageType: 0, hasChildren: 1 })]),
+  folderB: apiListing([apiItem({ pageId: "x2", pageName: "b.png" })])
+});
+
+async function pumpUntil(harness, predicate, rounds = 120) {
+  for (let round = 0; round < rounds && !predicate(); round += 1) {
+    harness.fireAlarm("popo-stable-downloader-pump");
+    await new Promise((resolve) => setTimeout(resolve, 15));
+  }
+  const state = harness.stored.popoState || {};
+  assert.ok(predicate(), `等待条件超时：${JSON.stringify({
+    mode: state.mode, phase: state.phase, apiScanQueue: state.apiScanQueue, started: state.apiScanStarted,
+    disabled: state.apiScanDisabled, resolveQueue: (state.resolveQueue || []).length, scanQueue: (state.scanQueue || []).length,
+    logs: (state.logs || []).slice(-4).map((entry) => [entry.code, entry.message, entry.details])
+  })}`);
+}
+
+test("接口扫描：两层目录带文件 ID，数量取自 total，不使用页面扫描与点击", async () => {
+  const { harness, calls, items } = apiScanHarness({ listings: standardListings() });
+  try {
+    await pumpUntil(harness, () => (harness.stored.popoState?.directoryScans || []).length === 2);
+    await pumpUntil(harness, () => items().length === 2);
+    const byName = Object.fromEntries(items().map((item) => [item.name, item]));
+    assert.equal(byName["a.png"].pageId, "x1");
+    assert.deepEqual(byName["a.png"].directoryPath, ["素材包"]);
+    assert.equal(byName["b.png"].pageId, "x2");
+    assert.deepEqual(byName["b.png"].directoryPath, ["素材包", "子目录"]);
+    assert.equal(byName["b.png"].directoryDirect, true);
+    assert.equal(byName["b.png"].parentUrl, "https://docs.popo.netease.com/team/pc/team1/pageDetail/folderB");
+    const scans = harness.stored.popoState.directoryScans;
+    assert.deepEqual(scans.map((scan) => [scan.path.join("/"), scan.expected, scan.found, scan.verified]),
+      [["素材包", 2, 2, true], ["素材包/子目录", 1, 1, true]]);
+    assert.equal(calls.some((type) => ["SCAN_DIRECTORY", "OPEN_ITEM"].includes(type)), false, calls.join(","));
+    assert.deepEqual(scans.map((scan) => scan.via), ["api", "api"]);
+    await pumpUntil(harness, () => Boolean(harness.stored.popoState.jobs[0].scanCompletedAt));
+    const job = harness.stored.popoState.jobs[0];
+    assert.ok(Date.parse(job.scanCompletedAt) >= Date.parse(job.startedAt), "扫描完成时间不早于开始时间");
+  } finally { harness.cleanup(); }
+});
+
+test("接口扫描：某子目录 more 为 true 时该目录转页面扫描，其余条目保留并记录回退", async () => {
+  const listings = standardListings();
+  listings.folderB = apiListing([apiItem({ pageId: "x2", pageName: "b.png" })], { more: true });
+  const { harness, calls, dirUrls, items } = apiScanHarness({ listings });
+  dirUrls.folderB = "子目录";
+  try {
+    await pumpUntil(harness, () => items().length === 2);
+    const byName = Object.fromEntries(items().map((item) => [item.name, item]));
+    assert.equal(byName["a.png"].pageId, "x1");
+    assert.equal(byName["b.png"].pageId, undefined, "页面扫描的条目没有文件 ID");
+    assert.ok(calls.includes("SCAN_DIRECTORY"));
+    const fallback = harness.stored.popoState.logs.find((entry) => entry.code === "API_SCAN_FALLBACK");
+    assert.ok(fallback, "必须记录回退事件");
+    assert.equal(fallback.context.reason, "more");
+    assert.equal(fallback.context.more, 1);
+    assert.equal(fallback.context.length, 1);
+  } finally { harness.cleanup(); }
+});
+
+test("接口扫描：同名文件夹不唯一时整体回退页面扫描并保留原定位队列", async () => {
+  const listings = standardListings();
+  listings.root1 = apiListing([
+    apiItem({ pageId: "f1", pageName: "素材包", pageType: 0 }), apiItem({ pageId: "f2", pageName: "素材包", pageType: 0 })
+  ]);
+  const { harness, calls } = apiScanHarness({ listings });
+  try {
+    await pumpUntil(harness, () => calls.includes("OPEN_ITEM"));
+    assert.equal(harness.stored.popoState.apiScanDisabled, true);
+    assert.equal(calls.filter((type) => type.startsWith("LIST_FOLDER")).length, 1);
+    assert.equal(harness.stored.popoState.logs.find((entry) => entry.code === "API_SCAN_FALLBACK").context.reason, "ambiguous_folder");
+  } finally { harness.cleanup(); }
+});
+
+test("接口扫描：目录接口返回业务错误时，回退事件带业务码与提示，便于定位", async () => {
+  const listings = standardListings();
+  listings.root1 = { status: 405, message: "没有权限操作", data: null };
+  const { harness, calls } = apiScanHarness({ listings });
+  try {
+    await pumpUntil(harness, () => calls.includes("OPEN_ITEM"));
+    const fallback = harness.stored.popoState.logs.find((entry) => entry.code === "API_SCAN_FALLBACK");
+    assert.equal(fallback.context.reason, "business_error");
+    assert.equal(fallback.context.businessStatus, 405);
+    assert.equal(fallback.context.detail, "没有权限操作");
+  } finally { harness.cleanup(); }
+});
+
+test("接口扫描：桥返回传输层失败（如没有请求模板）时，回退事件带 HTTP 状态与原因", async () => {
+  const { harness, calls } = apiScanHarness({ listings: {} });
+  try {
+    await pumpUntil(harness, () => calls.includes("OPEN_ITEM"));
+    const fallback = harness.stored.popoState.logs.find((entry) => entry.code === "API_SCAN_FALLBACK");
+    assert.equal(fallback.context.reason, "api_error");
+    assert.equal(fallback.context.detail, "no_template");
+    assert.equal(fallback.context.httpStatus, 0);
+  } finally { harness.cleanup(); }
+});
+
+test("接口扫描：同级目录并行列出（最多 4 个），结果仍按目录顺序写入且一个目录回退不影响其余", async () => {
+  const listings = {
+    root1: apiListing([apiItem({ pageId: "folderA", pageName: "素材包", pageType: 0, hasChildren: 1 })]),
+    folderA: apiListing(["s1", "s2", "s3", "s4", "s5"].map((id) =>
+      apiItem({ pageId: id, pageName: `目录${id}`, pageType: 0, hasChildren: 1 })))
+  };
+  for (const id of ["s1", "s2", "s3", "s4", "s5"]) {
+    listings[id] = apiListing([apiItem({ pageId: `file-${id}`, pageName: `${id}.png` })]);
+  }
+  listings.s3 = apiListing([apiItem({ pageId: "file-s3", pageName: "s3.png" })], { more: true });
+  const { harness, calls, listing, dirUrls } = apiScanHarness({ listings, listDelayMs: 25 });
+  dirUrls.s3 = "目录s3";
+  try {
+    await pumpUntil(harness, () => (harness.stored.popoState?.directoryScans || []).length === 6, 300);
+    assert.equal(listing.max, 4, "同级目录应并行列出，上限 4");
+    const paths = harness.stored.popoState.directoryScans.map((scan) => scan.path.join("/"));
+    assert.deepEqual(paths, ["素材包", "素材包/目录s1", "素材包/目录s2", "素材包/目录s4", "素材包/目录s5", "素材包/目录s3"],
+      "接口目录按顺序写入，回退的目录最后由页面扫描补上");
+    assert.ok(calls.includes("SCAN_DIRECTORY"), "回退的目录走页面扫描");
+    assert.equal(harness.stored.popoState.logs.filter((entry) => entry.code === "API_SCAN_FALLBACK").length, 1);
+  } finally { harness.cleanup(); }
+});
+
+test("接口扫描：设置 useApiScan 为 false 时完全走页面流程", async () => {
+  const { harness, calls } = apiScanHarness({ listings: standardListings(), settings: { useApiScan: false } });
+  try {
+    await pumpUntil(harness, () => calls.includes("OPEN_ITEM"));
+    assert.equal(calls.some((type) => type.startsWith("LIST_FOLDER")), false);
+  } finally { harness.cleanup(); }
+});
+
+test("接口扫描：补下任务按名称与目录路径找到目标，不依赖页面行号标识", async () => {
+  const listings = standardListings();
+  const failure = {
+    id: "stale-dom-id", kind: "file", name: "b.png", path: ["素材包", "子目录"],
+    url: "https://docs.popo.netease.com/team/pc/team1/pageDetail/folderB", rootUrl: API_ROOT_URL,
+    route: [{ name: "素材包", itemIndex: "1" }, { name: "子目录", itemIndex: "2" }]
+  };
+  const { harness, calls, items } = apiScanHarness({ listings, retrySelection: failure });
+  try {
+    await pumpUntil(harness, () => items().length === 1);
+    assert.equal(items()[0].name, "b.png");
+    assert.equal(items()[0].selected, true);
+    assert.equal(items()[0].pageId, "x2");
+    assert.ok(calls.includes("LIST_FOLDER:folderB"));
+  } finally { harness.cleanup(); }
+});
+
+// ── 按文件 ID 取址：条目带 pageId 时直接请求下载地址，不打开预览页。
+function byIdHarness({ item = {}, directBody, settings = {}, previewMedia, observedUrl = "" } = {}) {
+  const state = transferState({ includePending: true });
+  const first = state.items.find((entry) => entry.id === "pending-file");
+  state.items = [{
+    ...first, id: "id-file", name: "f.mp4", itemIndex: "", pageId: "page-f1",
+    directoryPath: [state.selectedFolderName], rootUrl: state.rootUrl, directoryRoute: [], ...item
+  }];
+  state.settings = { ...state.settings, concurrency: 5, ...settings };
+  state.triggerMode = "folder_button";
+  state.workerReadyUrl = state.rootUrl;
+  state.teamSpaceKey = "team1";
+  state.teamSpaceId = "space-real";
+  state.activeTransfers = [];
+  state.activeItemId = null;
+  state.gopeedConnected = true;
+  state.gopeedDownloadDir = "D:\\Downloads";
+  state.jobs[0].counts = { files: 1 };
+  const calls = [];
+  const definitions = [];
+  let currentUrl = state.rootUrl;
+  let send;
+  const harness = createHarness({ popoSettings: state.settings, popoState: state }, {
+    gopeedConfig: { downloadDir: "D:\\Downloads" },
+    gopeedTasks: [{ id: "task-1", status: "running", progress: { downloaded: 1, speed: 1 }, meta: { req: { labels: {} } } }],
+    async getGopeedTask(_settings, taskId) {
+      return { id: taskId, status: "running", progress: { downloaded: 1, speed: 1 }, meta: { req: { labels: {} } } };
+    },
+    async startOrReplaceGopeedTask(_settings, _taskId, definition) {
+      definitions.push(definition);
+      return { taskId: "task-1", replacedMissingTask: false };
+    },
+    async sendTabMessage(_tabId, message) {
+      calls.push(message.type);
+      if (message.type === "NAVIGATE_WORKER") {
+        currentUrl = message.url;
+        setTimeout(() => void send({ type: "REGISTER_WORKER_FRAME", url: message.url },
+          { tab: { id: 7, url: message.url }, url: message.url, frameId: 42 }), 0);
+      }
+      if (message.type === "PING") return { ok: true, result: { url: currentUrl, directoryName: state.selectedFolderName } };
+      if (message.type === "OPEN_ITEM") {
+        currentUrl = "https://docs.popo.netease.com/team/pc/team1/pageDetail/page-f1";
+        return { ok: true, result: { clicked: true } };
+      }
+      if (message.type === "GET_PREVIEW_INFO") return { ok: true, result: {
+        titleCandidates: ["f.mp4"],
+        media: previewMedia ?? [{ src: "https://bucket.s3v2.nie.netease.com/page.mp4?sig=1" }],
+        downloadButtonCount: 1, loadingCount: 0, previewElementCount: 1, pageId: "page-f1"
+      } };
+      if (message.type === "REQUEST_DIRECT_DOWNLOAD") return { ok: true, result: { ok: true, status: 200, body: directBody } };
+      if (message.type === "GET_OBSERVED_DOWNLOAD_URL") return { ok: true, result: { url: observedUrl } };
+      return { ok: true, result: {} };
+    }
+  });
+  send = harness.send;
+  const stored = () => harness.stored["popoItems:job-gopeed-control:0"]?.[0];
+  return { harness, calls, stored, definitions };
+}
+
+const PAGE_FLOW_CALLS = ["NAVIGATE_WORKER", "OPEN_ITEM", "GET_PREVIEW_INFO", "CLEAN_STATE"];
+const directBodyWithUrl = { code: 0, data: { url: "https://bucket.s3v2.nie.netease.com/direct.mp4?sig=2" } };
+
+test("按文件 ID 取址：只请求下载地址，不加载目录、不点开文件、不等预览", async () => {
+  const { harness, calls, stored } = byIdHarness({ directBody: directBodyWithUrl });
+  try {
+    await pumpUntil(harness, () => stored()?.status === "transferring");
+    assert.ok(calls.includes("REQUEST_DIRECT_DOWNLOAD"));
+    for (const type of PAGE_FLOW_CALLS) assert.equal(calls.includes(type), false, `${type}：${calls.join(",")}`);
+    assert.equal(stored().apiFallback, undefined);
+  } finally { harness.cleanup(); }
+});
+
+test("按文件 ID 取址失败（接口没有返回地址）：标记回退并在同一次尝试改走页面流程", async () => {
+  const { harness, calls, stored } = byIdHarness({ directBody: { code: 0, data: {} } });
+  try {
+    await pumpUntil(harness, () => stored()?.status === "transferring", 400);
+    assert.equal(stored().apiFallback, true);
+    assert.ok(calls.includes("OPEN_ITEM") && calls.includes("GET_PREVIEW_INFO"), calls.join(","));
+    assert.ok(harness.stored.popoState.logs.some((entry) => entry.code === "API_SCAN_FALLBACK" && entry.context.reason === "download_url"));
+  } finally { harness.cleanup(); }
+});
+
+test("按文件 ID 取址被拒绝（405）：改走页面流程，预览里有媒体地址时仍能下载", async () => {
+  const { harness, calls, stored } = byIdHarness({ directBody: { status: 405, message: "没有权限操作" } });
+  try {
+    await pumpUntil(harness, () => stored()?.status === "transferring", 300);
+    assert.equal(stored().apiFallback, true);
+    assert.ok(calls.includes("OPEN_ITEM") && calls.includes("GET_PREVIEW_INFO"), calls.join(","));
+  } finally { harness.cleanup(); }
+});
+
+test("按文件 ID 取址被拒绝（405）且页面流程也没有地址：标记权限失败", async () => {
+  const { harness, stored } = byIdHarness({ directBody: { status: 405, message: "没有权限操作" }, previewMedia: [] });
+  try {
+    await pumpUntil(harness, () => stored()?.status === "failed", 300);
+    assert.equal(stored().failureReason, "permission_denied");
+  } finally { harness.cleanup(); }
+});
+
+test("按文件 ID 取址不使用页面里按文件名观察到的旧地址", async () => {
+  const { harness, calls, stored, definitions } = byIdHarness({
+    directBody: { code: 0, data: {} }, observedUrl: "https://bucket.s3v2.nie.netease.com/OTHER-DIRECTORY-same-name.mp4?sig=9"
+  });
+  try {
+    await pumpUntil(harness, () => stored()?.status === "transferring", 400);
+    assert.ok(calls.includes("OPEN_ITEM"), "应改走页面流程");
+    assert.equal(definitions.some((definition) => definition.url.includes("OTHER-DIRECTORY")), false, JSON.stringify(definitions));
+  } finally { harness.cleanup(); }
+});
+
+test("已标记 apiFallback 的文件、以及 useApiScan 关闭时，不再按文件 ID 取址", async () => {
+  for (const config of [{ item: { apiFallback: true } }, { settings: { useApiScan: false } }]) {
+    const { harness, calls, stored } = byIdHarness({ directBody: directBodyWithUrl, ...config });
+    try {
+      await pumpUntil(harness, () => stored()?.status === "transferring", 200);
+      assert.equal(calls.includes("REQUEST_DIRECT_DOWNLOAD"), false, calls.join(","));
+      assert.ok(calls.includes("OPEN_ITEM"));
+    } finally { harness.cleanup(); }
+  }
+});
+
+const apiQueueEntry = {
+  pageId: "folderB", pageMajorVersion: 1, path: ["素材包", "子目录"],
+  url: "https://docs.popo.netease.com/team/pc/team1/pageDetail/folderB",
+  route: [{ name: "素材包", itemIndex: "1" }, { name: "子目录", itemIndex: "" }]
+};
+
+test("接口扫描：页面工作区恢复超限时，队列里未扫的目录记为失败而不是被静默丢弃", async () => {
+  const state = transferState({ mode: "waiting_worker", jobStatus: "waiting_worker", includePending: true });
+  state.triggerMode = "folder_button";
+  state.workerFrameId = null;
+  state.workerRecoveryStartedAt = Date.now() - 6 * 60_000;
+  state.workerRecoveryCount = 2;
+  state.workerRecoveryPending = false;
+  state.workerDeadline = Date.now() - 1;
+  state.activeTransfers = [];
+  state.scanQueue = [];
+  state.resolveQueue = [];
+  state.apiScanQueue = [structuredClone(apiQueueEntry)];
+  state.apiScanStarted = true;
+  const harness = createHarness({ popoSettings: state.settings, popoState: state });
+  try {
+    harness.fireAlarm("popo-stable-downloader-watchdog");
+    await waitUntil(() => harness.stored.popoState?.jobs?.[0]?.status === "failed");
+    const job = harness.stored.popoState.jobs[0];
+    assert.equal(job.counts.scanFailures, 1);
+    const entry = job.failureEntries.find((candidate) => candidate.kind === "directory");
+    assert.deepEqual(entry.path, ["素材包", "子目录"]);
+    assert.deepEqual(harness.stored.popoState.apiScanQueue, []);
+  } finally { harness.cleanup(); }
+});
+
+test("接口扫描：中途关闭 useApiScan 时，队列里的目录转页面扫描而不是丢失", async () => {
+  const { harness, calls, dirUrls, state } = apiScanHarness({
+    listings: standardListings(), settings: { useApiScan: false }
+  });
+  dirUrls.folderB = "子目录";
+  harness.stored.popoState.resolveQueue = [];
+  harness.stored.popoState.apiScanStarted = true;
+  harness.stored.popoState.apiScanQueue = [structuredClone(apiQueueEntry)];
+  try {
+    await pumpUntil(harness, () => (harness.stored.popoState?.directoryScans || []).length === 1);
+    assert.ok(calls.includes("SCAN_DIRECTORY"), calls.join(","));
+    assert.deepEqual(harness.stored.popoState.directoryScans[0].path, ["素材包", "子目录"]);
+    assert.deepEqual(harness.stored.popoState.apiScanQueue, []);
+  } finally { harness.cleanup(); }
+});
+
+test("先扫完再下：接口扫描尚有目录未列出时，不处理已有的待下载文件", async () => {
+  const { harness, calls } = apiScanHarness({ listings: standardListings() });
+  const pending = {
+    id: "early", name: "early.mp4", itemIndex: "", pageId: "early1", selected: true, status: "pending", attempts: 0,
+    directoryPath: ["素材包"], parentUrl: API_ROOT_URL, rootUrl: API_ROOT_URL, directoryRoute: []
+  };
+  harness.stored.popoState.items = [pending];
+  harness.stored.popoState.workflow = {
+    version: 1, sequence: 1, value: { scan: "running", handoff: "idle", transfer: "idle" },
+    nextAction: "handoff", reservedItemId: "", counts: {}, updatedAt: new Date().toISOString()
+  };
+  try {
+    await pumpUntil(harness, () => (harness.stored.popoState?.directoryScans || []).length === 2);
+    const firstRequest = calls.indexOf("REQUEST_DIRECT_DOWNLOAD");
+    const lastList = calls.map((type, index) => type.startsWith("LIST_FOLDER") ? index : -1).reduce((a, b) => Math.max(a, b), -1);
+    assert.ok(firstRequest === -1 || firstRequest > lastList, `扫描未完成前不得取址：${calls.join(",")}`);
+  } finally { harness.cleanup(); }
+});
+
+test("接口扫描：目录声称有子项却返回空列表时回退页面扫描，而不是记为已核对的空目录", async () => {
+  const listings = standardListings();
+  listings.folderB = apiListing([]);
+  listings.folderA = apiListing([
+    apiItem({ pageId: "x1", pageName: "a.png" }),
+    apiItem({ pageId: "folderB", pageName: "子目录", pageType: 0, hasChildren: 1 })
+  ]);
+  const { harness, calls, dirUrls } = apiScanHarness({ listings });
+  dirUrls.folderB = "子目录";
+  try {
+    await pumpUntil(harness, () => harness.stored.popoState.logs.some((entry) => entry.code === "API_SCAN_FALLBACK"));
+    const fallback = harness.stored.popoState.logs.find((entry) => entry.code === "API_SCAN_FALLBACK");
+    assert.equal(fallback.context.reason, "empty_unverified");
+    await pumpUntil(harness, () => calls.includes("SCAN_DIRECTORY"));
+  } finally { harness.cleanup(); }
+});
+
+test("接口扫描：单文件补下不递归子目录，也不会因子目录回退把成功的补下记成失败", async () => {
+  const listings = standardListings();
+  listings.folderB = apiListing([
+    apiItem({ pageId: "x2", pageName: "b.png" }),
+    apiItem({ pageId: "folderC", pageName: "更深", pageType: 0, hasChildren: 1 })
+  ]);
+  const failure = {
+    id: "stale", kind: "file", name: "b.png", path: ["素材包", "子目录"],
+    url: "https://docs.popo.netease.com/team/pc/team1/pageDetail/folderB", rootUrl: API_ROOT_URL,
+    route: [{ name: "素材包", itemIndex: "1" }, { name: "子目录", itemIndex: "2" }]
+  };
+  const { harness, calls, items } = apiScanHarness({ listings, retrySelection: failure });
+  try {
+    await pumpUntil(harness, () => items().length === 1);
+    assert.equal(calls.includes("LIST_FOLDER:folderC"), false, calls.join(","));
+    assert.deepEqual(harness.stored.popoState.apiScanQueue, []);
+  } finally { harness.cleanup(); }
+});
+
+test("先扫完再下：扫描队列清空前不处理待下载文件", async () => {
+  const state = transferState({ mode: "scanning", jobStatus: "scanning", includePending: true });
+  const pending = state.items.find((item) => item.id === "pending-file");
+  pending.directoryPath = [state.selectedFolderName];
+  pending.itemIndex = "1";
+  state.items = [pending];
+  state.triggerMode = "folder_button";
+  state.workerReadyUrl = state.rootUrl;
+  state.activeTransfers = [];
+  state.activeItemId = null;
+  state.scanQueue = [{ url: state.rootUrl, path: [state.selectedFolderName] }];
+  state.workflow = {
+    version: 1, sequence: 1, value: { scan: "running", handoff: "idle", transfer: "idle" },
+    nextAction: "handoff", reservedItemId: "", counts: {}, updatedAt: new Date().toISOString()
+  };
+  const events = [];
+  let send;
+  const harness = createHarness(
+    { popoSettings: state.settings, popoState: state },
+    {
+      gopeedConfig: { downloadDir: "D:\\Downloads" },
+      gopeedTasks: [],
+      async sendTabMessage(_tabId, message) {
+        if (message.type === "NAVIGATE_WORKER") setTimeout(() => void send(
+          { type: "REGISTER_WORKER_FRAME", url: message.url },
+          { tab: { id: 7, url: message.url }, url: message.url, frameId: 42 }
+        ), 0);
+        if (message.type === "PING") return { ok: true, result: { url: state.rootUrl, directoryName: state.selectedFolderName } };
+        if (message.type === "SCAN_DIRECTORY") {
+          events.push("SCAN_DIRECTORY");
+          return { ok: true, result: { url: state.rootUrl, directoryName: state.selectedFolderName,
+            items: [{ name: "pending.mp4", itemIndex: "1", type: "file" }], diagnostics: { expectedItemCount: 1 } } };
+        }
+        if (message.type === "OPEN_ITEM") {
+          events.push(`OPEN_ITEM:${message.name}`);
+          return { ok: false, error: "测试到此为止" };
+        }
+        return { ok: true, result: {} };
+      }
+    }
+  );
+  send = harness.send;
+  try {
+    harness.fireAlarm("popo-stable-downloader-pump");
+    await waitUntil(() => events.length > 0);
+    assert.equal(events[0], "SCAN_DIRECTORY", `扫描完成前不得处理文件：${events.join(",")}`);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("文件准备失败后退避重试，先处理其他待下载文件", async () => {
+  const state = transferState({ includePending: true });
+  const first = state.items.find((item) => item.id === "pending-file");
+  first.directoryPath = [state.selectedFolderName];
+  first.itemIndex = "1";
+  const second = { ...first, id: "second-file", name: "second.mp4", itemIndex: "2" };
+  state.items = [first, second];
+  state.triggerMode = "folder_button";
+  state.workerReadyUrl = state.rootUrl;
+  state.activeTransfers = [];
+  state.activeItemId = null;
+  state.jobs[0].counts = { files: 2 };
+  const opened = [];
+  let send;
+  const harness = createHarness(
+    { popoSettings: state.settings, popoState: state },
+    {
+      gopeedConfig: { downloadDir: "D:\\Downloads" },
+      gopeedTasks: [],
+      async sendTabMessage(_tabId, message) {
+        if (message.type === "NAVIGATE_WORKER") setTimeout(() => void send(
+          { type: "REGISTER_WORKER_FRAME", url: message.url },
+          { tab: { id: 7, url: message.url }, url: message.url, frameId: 42 }
+        ), 0);
+        if (message.type === "PING") return { ok: true, result: { url: state.rootUrl } };
+        if (message.type === "OPEN_ITEM") {
+          opened.push(message.name);
+          return { ok: false, error: "目录加载超时" };
+        }
+        return { ok: true, result: {} };
+      }
+    }
+  );
+  send = harness.send;
+  try {
+    harness.fireAlarm("popo-stable-downloader-pump");
+    await waitUntil(() => opened.length === 1);
+    await waitUntil(() => !harness.stored.popoState.preparingItemId);
+    const deferred = harness.stored["popoItems:job-gopeed-control:0"][0];
+    assert.equal(deferred.status, "pending");
+    assert.ok(deferred.retryNotBefore > Date.now(), "失败文件必须带退避时间");
+    harness.fireAlarm("popo-stable-downloader-pump");
+    await waitUntil(() => opened.length === 2);
+    assert.deepEqual(opened, ["pending.mp4", "second.mp4"]);
+    await waitUntil(() => !harness.stored.popoState.preparingItemId);
+    harness.fireAlarm("popo-stable-downloader-pump");
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(opened.length, 2, "退避期内不得立即重试");
+    assert.equal(harness.stored.popoState.jobs[0].status, "downloading");
+  } finally {
+    harness.cleanup();
+  }
+});
+
+for (const titleMatches of [true, false]) {
+  test(`目录有独立地址时${titleMatches ? "直接打开，不从根目录逐层点击" : "若目录名不符则回退逐层进入"}`, async () => {
+    const childUrl = "https://docs.popo.netease.com/team/pc/team1/pageDetail/child1";
+    const state = transferState({ includePending: true });
+    const pending = state.items.find((item) => item.id === "pending-file");
+    Object.assign(pending, {
+      directoryPath: [state.selectedFolderName, "子目录"], itemIndex: "3",
+      rootUrl: state.rootUrl, parentUrl: childUrl, directoryDirect: true,
+      directoryRoute: [{ name: "子目录", itemIndex: "1" }]
+    });
+    state.items = [pending];
+    state.triggerMode = "folder_button";
+    state.workerReadyUrl = state.rootUrl;
+    state.activeTransfers = [];
+    state.activeItemId = null;
+    state.jobs[0].counts = { files: 1 };
+    const navigated = [];
+    const opened = [];
+    let currentUrl = state.rootUrl;
+    let send;
+    const harness = createHarness(
+      { popoSettings: state.settings, popoState: state },
+      {
+        gopeedConfig: { downloadDir: "D:\\Downloads" },
+        gopeedTasks: [],
+        async sendTabMessage(_tabId, message) {
+          if (message.type === "NAVIGATE_WORKER") {
+            navigated.push(message.url);
+            currentUrl = message.url;
+            setTimeout(() => void send(
+              { type: "REGISTER_WORKER_FRAME", url: message.url },
+              { tab: { id: 7, url: message.url }, url: message.url, frameId: 42 }
+            ), 0);
+          }
+          if (message.type === "PING") {
+            return { ok: true, result: {
+              url: currentUrl,
+              directoryName: currentUrl === childUrl && titleMatches ? "子目录" : "别的目录",
+              contextKey: currentUrl
+            } };
+          }
+          if (message.type === "OPEN_ITEM") {
+            opened.push(`${message.expectedType}:${message.name}`);
+            if (message.expectedType === "folder") {
+              currentUrl = childUrl;
+              return { ok: true, result: { clicked: true } };
+            }
+            return { ok: false, error: "测试到此为止" };
+          }
+          return { ok: true, result: {} };
+        }
+      }
+    );
+    send = harness.send;
+    try {
+      harness.fireAlarm("popo-stable-downloader-pump");
+      // 回退路径要先等满目录身份确认时限（3 秒）。
+      for (let round = 0; round < 1000 && !opened.includes("file:pending.mp4"); round += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.ok(opened.includes("file:pending.mp4"), "没有走到定位文件");
+      if (titleMatches) {
+        assert.deepEqual(navigated, [childUrl]);
+        assert.deepEqual(opened, ["file:pending.mp4"]);
+      } else {
+        assert.deepEqual(navigated, [childUrl, state.rootUrl]);
+        assert.deepEqual(opened, ["folder:子目录", "file:pending.mp4"]);
+      }
+    } finally {
+      harness.cleanup();
+    }
+  });
+}
 
 test("Gopeed 成功记录读取失败时保持排队且不创建下载", async () => {
   const state = transferState({ includePending: true });

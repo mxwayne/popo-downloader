@@ -241,9 +241,12 @@ export function choosePersistentWorkflowAction(input: {
   hasPreparing: boolean;
   activeTransfers: number;
   concurrency: number;
+  /** 扫描队列与定位队列都已清空。未清空时只允许收尾已在准备的文件。 */
+  scanFinished: boolean;
 }): "scan" | "handoff" {
   const workflow = normalizePersistentWorkflow(input.workflow);
   if (input.hasPreparing) return "handoff";
+  if (!input.scanFinished) return "scan";
   const activeTransfers = nonNegativeInteger(input.activeTransfers);
   const concurrency = Math.max(1, nonNegativeInteger(input.concurrency));
   if (workflow.nextAction === "handoff" && input.hasPending && activeTransfers < concurrency) {

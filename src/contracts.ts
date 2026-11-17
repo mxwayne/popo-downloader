@@ -1,3 +1,9 @@
+/**
+ * [INPUT]: 依赖 Zod 数据校验。
+ * [OUTPUT]: 导出扩展命令、Gopeed 响应与存储任务的运行时契约。
+ * [POS]: 后台输入边界；单项恢复仅接受已存失败标识。
+ * [PROTOCOL]: Update this header on change, then check AGENTS.md
+ */
 import { z } from "zod";
 
 export const JOB_STATUSES = [
@@ -31,6 +37,7 @@ const SettingsSchema = z.strictObject({
   maxRetries: z.number().int().min(0).max(10).optional(),
   recursive: z.boolean().optional(),
   preserveStructure: z.boolean().optional(),
+  useApiScan: z.boolean().optional(),
   timeouts: z.record(z.string(), z.number().int().min(100).max(86_400_000)).optional()
 });
 
@@ -41,6 +48,7 @@ const SimpleCommandSchema = z.strictObject({
     "GET_UPDATE_DIAGNOSTICS",
     "GET_DIAGNOSTIC_STATUS",
     "SEND_DIAGNOSTICS",
+    "GET_PAGE_PROBE",
     "CHECK_GOPEED",
     "CANCEL_FOLDER_TASK",
     "START_DOWNLOAD",
@@ -55,6 +63,11 @@ const SimpleCommandSchema = z.strictObject({
 });
 
 const JobCommandSchema = z.union([
+  z.strictObject({
+    type: z.literal("RETRY_JOB_ITEM"),
+    jobId: z.string().min(1).max(200),
+    failureId: z.string().min(1).max(32768)
+  }),
   z.strictObject({
     type: z.enum(["CANCEL_JOB", "RETRY_JOB", "DISMISS_JOB"]),
     jobId: z.string().min(1).max(200)
@@ -107,6 +120,10 @@ export const RuntimeCommandSchema = z.union([
     type: z.literal("START_PAGE_DOWNLOAD"),
     pageName: z.string().min(1).max(1024),
     parentUrl: z.url({ protocol: /^https$/, hostname: /^docs\.popo\.netease\.com$/ })
+  }),
+  z.strictObject({
+    type: z.literal("PAGE_PROBE_REPORT"),
+    report: z.record(z.string(), z.unknown())
   }),
   z.strictObject({
     type: z.enum(["SOURCE_PAGE_READY", "REGISTER_WORKER_FRAME"]),

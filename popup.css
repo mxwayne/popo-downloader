@@ -766,3 +766,21 @@ footer {
     transition: none;
   }
 }
+/* 目录进度与失败明细：弹窗与页面面板共用 popo-detail-* 类名。 */
+.popo-detail { margin-top: 10px; font-size: 12px; }
+.popo-detail details + details { margin-top: 4px; }
+.popo-detail summary { cursor: pointer; padding: 6px 0; color: #b9d7ff; }
+.popo-detail ul { list-style: none; margin: 4px 0; padding: 0; max-height: 290px; overflow-y: auto; }
+.popo-detail li { padding: 10px 0; border-top: 1px solid #ffffff1a; overflow-wrap: anywhere; }
+.popo-detail-directory { padding: 6px 0 !important; color: #c9d5e0; }
+.popo-detail-directory[data-status="failed"] { color: #f2bdc5; }
+.popo-detail-directory[data-status="unverified"] { color: #e8d29a; }
+.popo-detail-name { display: flex; align-items: baseline; gap: 6px; }
+.popo-detail-name span { flex: none; color: #b9c8d6; font-size: 10px; }
+.popo-detail-name strong { min-width: 0; }
+.popo-detail-path { margin-top: 4px; color: #b9c8d6; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.popo-detail p { margin: 6px 0 8px; color: #f2bdc5; line-height: 1.5; }
+.popo-detail button { min-height: 28px; padding: 0 8px; font-size: 10px; }
+/* 展开失败明细时解除任务列表的 300px 上限，只保留明细自身一层滚动。 */
+.popup-queue-list:has(.popo-detail-failures[open]) { max-height: none; }
+.popo-detail-timing { margin-top: 6px; color: #9fb4c8; font-size: 11px; }

@@ -49,6 +49,7 @@ import {
   networkReminderVisible,
   nextNetworkNotice,
   nextServiceNotice,
+  notificationForReceipt,
   notificationForTransition,
   recoverableCount,
   summarizeLiveJobs,
@@ -90,6 +91,8 @@ const OWNED_SELECTOR = [
 const ENSURE_WORKER_EVENT = "popo-stable-download:ensure-worker";
 const PAGE_ROUTE_CHANGE_EVENT = "popo-stable-download:page-route-change";
 const PAGE_DETAIL_PATTERN = /\/pageDetail\/[a-z0-9]+/i;
+// POPO 类型筛选按钮的文案随界面语言变化；它是项目数与一键下载的挂载锚点。
+const TYPE_FILTER_LABELS = new Set(["所有类型", "所有類型", "All types"]);
 const DIRECTORY_CONTENT_SETTLE_MS = 80;
 const DIRECTORY_TRANSITION_TIMEOUT_MS = 5000;
 const DIRECTORY_POINTER_INTENT_TIMEOUT_MS = 700;
@@ -229,7 +232,7 @@ function currentVirtualListItemCount(
 
 function projectCountPlacement(): { host: HTMLElement; leftControl: HTMLElement } | null {
   const label = Array.from(document.querySelectorAll<HTMLElement>("span"))
-    .find((element) => normalizeText(element.textContent) === "所有类型");
+    .find((element) => TYPE_FILTER_LABELS.has(normalizeText(element.textContent)));
   const leftControl = label?.parentElement;
   const host = leftControl?.parentElement;
   if (!host || !leftControl || !host.contains(leftControl)) return null;
@@ -816,6 +819,7 @@ function useExtensionState(onNotification: (notification: UiNotification) => voi
 } {
   const [state, setState] = useState<QueueState | null>(null);
   const statuses = useRef(new Map<string, QueueJob["status"]>());
+  const seenReceipts = useRef(new Set<string>());
   const initialized = useRef(false);
 
   const refresh = useCallback(async () => {
@@ -827,6 +831,13 @@ function useExtensionState(onNotification: (notification: UiNotification) => voi
           const notification = notificationForTransition(statuses.current.get(job.id) || null, job);
           if (notification) onNotification(notification);
         }
+      }
+      // 成功完成的任务不在列表里：用新出现的完成凭证给出完成提示（含扫描与下载用时）。
+      for (const receipt of nextState.folderReceipts || []) {
+        const stamp = `${receipt.key}:${receipt.completedAt}`;
+        if (seenReceipts.current.has(stamp)) continue;
+        seenReceipts.current.add(stamp);
+        if (initialized.current && !nextState.popupOpen) onNotification(notificationForReceipt(receipt));
       }
       statuses.current = new Map((nextState.jobs || []).map((job) => [job.id, job.status]));
       initialized.current = true;

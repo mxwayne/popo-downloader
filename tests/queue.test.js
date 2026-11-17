@@ -85,6 +85,20 @@ test("client view hides finished jobs and resolved failures", () => {
   );
 });
 
+test("旧任务缺少时间戳时不能隐藏单项重试留下的失败", () => {
+  const source = { id: "legacy", key: "folder", status: "failed", counts: { failed: 2 } };
+  const retry = { id: "retry", key: "folder", status: "failed", retryOfJobId: source.id,
+    createdAt: "2026-11-13T00:00:00Z", counts: { failed: 1 } };
+  assert.deepEqual(clientVisibleJobs([retry, source]).map((job) => job.id), ["retry"]);
+});
+
+test("取消单项补下后原失败仍可再次手动恢复", () => {
+  const source = { id: "source", key: "folder", status: "failed", counts: { failed: 2 } };
+  const retry = { id: "cancelled-retry", key: "folder", status: "cancelled", retryOfJobId: source.id,
+    createdAt: "2026-11-13T00:00:00Z", counts: { cancelled: 0 } };
+  assert.deepEqual(clientVisibleJobs([source, retry]).map((job) => job.id), ["source"]);
+});
+
 test("误取消任务在恢复完成前保持可见", () => {
   const cancelled = {
     id: "cancelled-recoverable",

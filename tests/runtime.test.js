@@ -203,15 +203,31 @@ test("XState 持久化工作流可独立恢复扫描、交付和传输区域", (
     hasPending: true,
     hasPreparing: false,
     activeTransfers: 2,
-    concurrency: 5
+    concurrency: 5,
+    scanFinished: true
   }), "handoff");
   assert.equal(runtime.workflow.choosePersistentWorkflowAction({
     workflow: restored,
     hasPending: true,
     hasPreparing: false,
     activeTransfers: 5,
-    concurrency: 5
+    concurrency: 5,
+    scanFinished: true
   }), "scan");
+});
+
+test("先扫完再下：扫描未结束时不交付，已在准备的文件除外", () => {
+  const workflow = runtime.workflow.updatePersistentWorkflow(
+    runtime.workflow.createPersistentWorkflow(),
+    { nextAction: "handoff" }
+  );
+  const base = { workflow, hasPending: true, hasPreparing: false, activeTransfers: 0, concurrency: 5 };
+  assert.equal(runtime.workflow.choosePersistentWorkflowAction({ ...base, scanFinished: false }), "scan");
+  assert.equal(runtime.workflow.choosePersistentWorkflowAction({ ...base, scanFinished: true }), "handoff");
+  assert.equal(
+    runtime.workflow.choosePersistentWorkflowAction({ ...base, hasPreparing: true, scanFinished: false }),
+    "handoff"
+  );
 });
 
 test("Gopeed 官方 SDK 创建任务并由 Zod 校验返回数据", async () => {
@@ -287,4 +303,14 @@ test("生产 Gopeed 适配层优先使用官方 SDK", async () => {
     global.PopoRuntime = originalRuntime;
     delete require.cache[gopeedPath];
   }
+});
+
+test("页面结构诊断命令：接受对象报告，拒绝多余字段，GET_PAGE_PROBE 为简单命令", () => {
+  assert.deepEqual(
+    runtime.contracts.parseRuntimeCommand({ type: "PAGE_PROBE_REPORT", report: { apis: [] } }),
+    { type: "PAGE_PROBE_REPORT", report: { apis: [] } }
+  );
+  assert.throws(() => runtime.contracts.parseRuntimeCommand({ type: "PAGE_PROBE_REPORT", report: {}, extra: 1 }));
+  assert.throws(() => runtime.contracts.parseRuntimeCommand({ type: "PAGE_PROBE_REPORT", report: "x" }));
+  assert.deepEqual(runtime.contracts.parseRuntimeCommand({ type: "GET_PAGE_PROBE" }), { type: "GET_PAGE_PROBE" });
 });

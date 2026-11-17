@@ -1,3 +1,9 @@
+/**
+ * [INPUT]: 依赖 React、ui-model 与显式注入的 UiActions。
+ * [OUTPUT]: 导出任务卡、失败明细、服务设置与诊断组件。
+ * [POS]: 弹窗完整操作界面；通过后台命令发起恢复。
+ * [PROTOCOL]: Update this header on change, then check AGENTS.md
+ */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
@@ -23,6 +29,7 @@ import {
 } from "../ui-model";
 
 import { useUiActions } from "./actions";
+import { JobTiming, TaskDetails } from "./task-details";
 interface StateResponse {
   state: QueueState;
   settings: GopeedSettings;
@@ -150,6 +157,12 @@ export function TaskCard({
       </div>
       <div className="popup-queue-meta">{jobDetail(job)}</div>
       {job.status !== "queued" && <PopupProgress job={job} />}
+      <JobTiming job={job} />
+      <TaskDetails
+        job={job}
+        busy={busy}
+        onRetry={(failureId) => void run({ type: "RETRY_JOB_ITEM", jobId: job.id, failureId })}
+      />
       {!confirmingDismiss ? (
         <div className="popup-queue-actions">
           {job.id === activeJobId && job.status === "downloading" && (
@@ -317,6 +330,25 @@ export function UpdateDiagnosticsCard({
     }
   };
 
+  const [probeCopied, setProbeCopied] = useState(false);
+  const copyPageProbe = async () => {
+    setBusy(true);
+    try {
+      const response = await callExtension<{ probe: unknown }>({ type: "GET_PAGE_PROBE" });
+      await copyText(
+        response.probe
+          ? JSON.stringify(response.probe, null, 2)
+          : "还没有页面结构诊断：请先在 POPO 页面下载一个文件夹，再回来复制。",
+      );
+      setProbeCopied(true);
+    } catch (error) {
+      setProbeCopied(false);
+      showError(error);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const sendDiagnostics = async () => {
     setBusy(true);
     try {
@@ -375,6 +407,14 @@ export function UpdateDiagnosticsCard({
             onClick={() => void copyDiagnostics()}
           >
             {copied ? "已复制" : "复制诊断信息"}
+          </button>
+          <button
+            id="copyPageProbeButton"
+            type="button"
+            disabled={busy}
+            onClick={() => void copyPageProbe()}
+          >
+            {probeCopied ? "已复制" : "复制页面结构诊断"}
           </button>
         </div>
       </div>

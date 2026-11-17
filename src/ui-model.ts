@@ -1,3 +1,12 @@
+/**
+ * [INPUT]: 依赖失败条目类型与任务摘要。
+ * [OUTPUT]: 导出界面状态、数量、进度与通知规则。
+ * [POS]: 弹窗和页面共享的纯展示规则，不执行下载。
+ * [PROTOCOL]: Update this header on change, then check AGENTS.md
+ */
+import type { DirectorySummary } from "./directory-summary";
+import type { FailureEntry } from "./download-recovery";
+
 export const JOB_STATUSES = [
   "queued",
   "waiting_worker",
@@ -50,12 +59,19 @@ export interface QueueJob {
   cancelRequested?: boolean | undefined;
   cancelledRetryKeys?: string[] | undefined;
   failureRetryKeys?: string[] | undefined;
+  failureEntries?: FailureEntry[] | undefined;
+  failureEntriesOmitted?: number | undefined;
+  directories?: DirectorySummary[] | undefined;
   createdAt?: string | undefined;
   startedAt?: string | undefined;
   updatedAt?: string | undefined;
   completedAt?: string | undefined;
   verifiedCompletion?: boolean | undefined;
+  scanCompletedAt?: string | undefined;
+  scanVia?: ScanVia | undefined;
 }
+
+export type ScanVia = "api" | "page" | "mixed";
 
 export interface FolderCompletionReceipt {
   key: string;
@@ -64,6 +80,10 @@ export interface FolderCompletionReceipt {
   folderName: string;
   completedAt: string;
   counts?: JobCounts | undefined;
+  /** 任务开始、扫描结束的时刻与扫描方式：任务结束后列表里没有它，用时随凭证保留。 */
+  startedAt?: string | undefined;
+  scanCompletedAt?: string | undefined;
+  scanVia?: ScanVia | undefined;
 }
 
 export const FOLDER_RECEIPT_FEEDBACK_MS = 2 * 60 * 1000;
@@ -625,14 +645,17 @@ export function notificationForTransition(
 ): UiNotification | null {
   if (previousStatus == null || previousStatus === job.status) return null;
   const stamp = job.completedAt || job.updatedAt || job.id;
+  // 任务结束后会从列表消失，用时只能放进完成提示里让用户看到。
+  const timing = jobTimingLabel(job);
+  const message = timing ? `${jobDetail(job)} · ${timing}` : jobDetail(job);
   if (job.status === "complete") {
     return {
       id: `${job.id}:complete:${stamp}`,
       jobId: job.id,
       kind: "success",
       title: jobName(job),
-      message: jobDetail(job),
-      timeoutMs: 3000
+      message,
+      timeoutMs: timing ? 10000 : 3000
     };
   }
   if (job.status === "failed") {
@@ -641,11 +664,28 @@ export function notificationForTransition(
       jobId: job.id,
       kind: "error",
       title: jobName(job),
-      message: jobDetail(job),
+      message,
       timeoutMs: null
     };
   }
   return null;
+}
+
+/** 成功完成的任务不会出现在任务列表里，页面靠新出现的完成凭证提示用户。 */
+export function notificationForReceipt(receipt: FolderCompletionReceipt): UiNotification {
+  const timing = jobTimingLabel({
+    id: receipt.key, status: "complete", startedAt: receipt.startedAt,
+    scanCompletedAt: receipt.scanCompletedAt, completedAt: receipt.completedAt, scanVia: receipt.scanVia
+  });
+  const count = `已完成 ${Number(receipt.counts?.success) || 0} 个文件`;
+  return {
+    id: `${receipt.key}:receipt:${receipt.completedAt}`,
+    jobId: receipt.key,
+    kind: "success",
+    title: receipt.folderName,
+    message: timing ? `${count} · ${timing}` : count,
+    timeoutMs: timing ? 10000 : 3000
+  };
 }
 
 export function nextServiceNotice(
@@ -805,3 +845,41 @@ export function userFacingError(error: unknown): string {
 import type { NetworkHealth } from "./network-monitor";
 
 export type { NetworkHealth, NetworkHealthStatus } from "./network-monitor";
+
+export function directoryProgressLabel(summary: DirectorySummary): string {
+  const name = summary.path.join(" / ") || "当前目录";
+  if (summary.status === "failed") return `${name} · 读取失败`;
+  if (summary.status === "unverified") return `${name} · 未核对数量（已发现 ${summary.found} 项）`;
+  const total = summary.expected ?? summary.found;
+  const running = summary.active ? ` · 进行中 ${summary.active}` : "";
+  const failed = summary.failed ? ` · 失败 ${summary.failed}` : "";
+  return `${name} · 完成 ${summary.success}/${total}${running}${failed}`;
+}
+
+export function formatDuration(ms: number): string {
+  const seconds = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
+  if (seconds < 60) return `${seconds} 秒`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
+  return `${Math.floor(seconds / 3600)} 小时 ${Math.floor((seconds % 3600) / 60)} 分`;
+}
+
+/** 扫描与下载分开计时；旧任务没有扫描完成时间时只在扫描中显示已用时间。 */
+export function jobTimingLabel(job: QueueJob, now = Date.now()): string {
+  const started = Date.parse(job.startedAt || "");
+  if (!Number.isFinite(started)) return "";
+  if (job.status === "scanning" || job.status === "waiting_worker") {
+    return job.scanCompletedAt ? "" : `扫描已用 ${formatDuration(now - started)}`;
+  }
+  const scanned = Date.parse(job.scanCompletedAt || "");
+  if (!Number.isFinite(scanned)) return "";
+  const vias = new Set((job.directories || []).map((entry) => entry.via));
+  const via: ScanVia | "" = job.scanVia || (vias.has("api") && vias.has("page") ? "mixed"
+    : vias.has("api") ? "api" : vias.has("page") ? "page" : "");
+  const method = via === "mixed" ? "（接口+页面）" : via === "api" ? "（接口）" : via === "page" ? "（页面）" : "";
+  const scanPart = `扫描用时 ${formatDuration(scanned - started)}${method}`;
+  const completed = Date.parse(job.completedAt || "");
+  if (TERMINAL_JOB_STATUSES.has(job.status) && Number.isFinite(completed)) {
+    return `${scanPart} · 下载用时 ${formatDuration(completed - scanned)}`;
+  }
+  return `${scanPart} · 下载已用 ${formatDuration(now - scanned)}`;
+}

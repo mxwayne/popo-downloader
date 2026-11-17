@@ -157,6 +157,316 @@ test.afterAll(async () => {
   await rm(sandboxRoot, { recursive: true, force: true });
 });
 
+test("失败明细展示全部条目并能单独重试，长路径不撑开任务卡", async () => {
+  const { worker, extensionId } = await launchExtension();
+  const rootUrl = "https://docs.popo.netease.com/team/pc/team1/pageDetail/root1";
+  const now = new Date().toISOString();
+  const failures = Array.from({ length: 8 }, (_, index) => ({
+    id: `failed-${index}`, kind: index === 7 ? "directory" : "file",
+    name: index === 7 ? "未完成子目录" : `未完成文件 ${index + 1}.png`,
+    path: ["素材包", "多层原始目录".repeat(18)],
+    stage: "目录加载失败", error: "点击后没有进入目标文件夹，请重新读取",
+    retryKey: `retry-key-${index}`, url: rootUrl, rootUrl,
+    route: [{ name: "素材包", itemIndex: "1" }]
+  }));
+  const popup = await openPopup(extensionId);
+  // 后台首次启动会写入默认状态；等它落盘后再注入，避免注入被覆盖。
+  await expect.poll(() => worker.evaluate(async () => {
+    const { popoState } = await chrome.storage.local.get("popoState");
+    return Boolean(popoState);
+  })).toBe(true);
+  await worker.evaluate(async ({ rootUrl, now, failures }) => {
+    await chrome.storage.local.set({ popoState: {
+      version: 4, runToken: "e2e-single-retry", mode: "idle", jobs: [{
+        id: "e2e-failed", key: "e2e-folder", status: "failed", folderName: "素材包",
+        parentUrl: rootUrl, folderItemIndex: "1", sourceTabId: null,
+        createdAt: now, completedAt: now,
+        counts: { files: 73, success: 66, failed: 7, scanFailures: 1, unverifiedDirectories: 1 },
+        failureEntries: failures, failureRetryKeys: failures.slice(0, 7).map((entry) => entry.retryKey)
+      }], activeJobId: null, items: [], logs: []
+    } });
+  }, { rootUrl, now, failures });
+  await popup.reload();
+  await popup.setViewportSize({ width: 390, height: 850 });
+  await popup.getByText("失败明细（8）", { exact: true }).click();
+  const details = popup.locator(".popo-detail-failures");
+  await expect(details.getByRole("button", { name: /^单独重试 / })).toHaveCount(8);
+  await expect(details.getByText("未完成文件 7.png", { exact: true })).toBeVisible();
+  await expect(details.getByText("未完成子目录", { exact: true })).toBeVisible();
+  expect(await popup.locator(".popup-queue-item").evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
+  await mkdir(resolve(projectRoot, "output/download-recovery"), { recursive: true });
+  await popup.screenshot({ path: resolve(projectRoot, "output/download-recovery/popup-failure-details.png"), fullPage: true });
+  await details.getByRole("button", { name: "单独重试 未完成文件 1.png", exact: true }).click();
+  await expect.poll(async () => worker.evaluate(async () => {
+    const { popoState } = await chrome.storage.local.get("popoState");
+    return popoState.jobs.filter((job) => job.retryOfJobId === "e2e-failed").length;
+  })).toBe(1);
+  const retry = await worker.evaluate(async () => {
+    const { popoState } = await chrome.storage.local.get("popoState");
+    return popoState.jobs.find((job) => job.retryOfJobId === "e2e-failed");
+  });
+  expect(retry.retrySelection.id).toBe("failed-0");
+  expect(retry.retainedFailures).toHaveLength(7);
+  expect(retry.counts.success).toBe(66);
+  await expect(popup.locator(".popup-queue-item")).toHaveCount(1);
+});
+
+test("页面左下角面板展开后显示目录与失败项，并能单独重试", async () => {
+  await launchExtension();
+  const page = await context.newPage();
+  await page.route("https://example.test/**", (route) => route.fulfill({
+    contentType: "text/html",
+    body: "<!doctype html><html><body></body></html>"
+  }));
+  await page.goto("https://example.test/team/pc/test/pageDetail/folder");
+  await page.setContent(`
+    <title>整页素材</title>
+    <div id="toolbar"><button><span>所有类型</span></button></div>
+    <div data-test-id="virtuoso-scroller">
+      <div data-test-id="virtuoso-item-list" style="padding-bottom: 48px">
+        <div data-item-index="0" data-known-size="48" style="display:flex;width:900px;height:48px;align-items:center">
+          <div class="pageName" style="flex:1"><span class="drive-icon-folder"></span><span class="topName">官方素材</span></div>
+          <div class="listMore"><button aria-label="更多">…</button></div>
+        </div>
+      </div>
+    </div>
+  `);
+  await page.evaluate(() => {
+    const rootUrl = "https://docs.popo.netease.com/team/pc/test/pageDetail/root1";
+    const entry = (id, kind, name) => ({
+      id, kind, name, path: ["官方素材", "劫妹"], stage: "目录加载失败", error: "目录数量核对不一致",
+      url: rootUrl, rootUrl, route: [{ name: "劫妹", itemIndex: "2" }]
+    });
+    const state = {
+      jobs: [{
+        id: "job-failed", status: "failed", folderName: "官方素材", folderItemIndex: "0", parentUrl: rootUrl,
+        startedAt: "2026-11-17T10:00:00.000Z", scanCompletedAt: "2026-11-17T10:00:12.000Z", completedAt: "2026-11-17T10:03:32.000Z",
+        counts: { files: 47, success: 47, failed: 0, scanFailures: 1 },
+        directories: [
+          { path: ["官方素材"], expected: 7, found: 7, success: 5, failed: 0, active: 0, pending: 0, status: "verified", via: "api" },
+          { path: ["官方素材", "劫妹"], expected: null, found: 0, success: 0, failed: 0, active: 0, pending: 0, status: "failed", via: "page" }
+        ],
+        failureEntries: [entry("fail-a", "directory", "劫妹"), entry("fail-b", "file", "icon_a.png")],
+        failureRetryKeys: ["k"]
+      }],
+      folderReceipts: [], activeJobId: null, mode: "failed", popupOpen: false
+    };
+    const calls = [];
+    const runtime = {
+      getURL: () => "data:image/svg+xml,%3Csvg%3E%3C/svg%3E",
+      sendMessage: async (message) => {
+        calls.push(message);
+        if (message.type === "GET_STATE") return { ok: true, state: JSON.parse(JSON.stringify(state)), settings: {} };
+        if (message.type === "CHECK_GOPEED") return { ok: true, connection: { connected: true }, settings: {} };
+        return { ok: true, state: JSON.parse(JSON.stringify(state)) };
+      },
+      onMessage: { addListener() {}, removeListener() {} }
+    };
+    window.chrome = window.chrome || {};
+    Object.defineProperty(window.chrome, "runtime", { configurable: true, value: runtime });
+    window.__popoUiTest = { state, calls };
+  });
+  await page.addScriptTag({ path: resolve(projectRoot, "runtime/page-ui.js") });
+  await page.locator(".popo-page-queue-toggle").click();
+  const queue = page.locator(".popo-page-queue");
+  await expect(queue.locator(".popo-detail-timing")).toHaveText("扫描用时 12 秒（接口+页面） · 下载用时 3 分 20 秒");
+  await expect(queue.locator(".popo-detail-directory")).toHaveCount(2);
+  await expect(queue.locator(".popo-detail-directory").nth(0)).toContainText("完成 5/7");
+  await expect(queue.locator(".popo-detail-directory").nth(1)).toContainText("读取失败");
+  await queue.locator(".popo-detail-failures summary").click();
+  await expect(queue.getByRole("button", { name: "单独重试 icon_a.png" })).toBeVisible();
+  await mkdir(resolve(projectRoot, "output/download-recovery"), { recursive: true });
+  await queue.screenshot({ path: resolve(projectRoot, "output/download-recovery/page-dock-details.png") });
+  await queue.getByRole("button", { name: "单独重试 icon_a.png" }).click();
+  await expect.poll(() => page.evaluate(() =>
+    window.__popoUiTest.calls.filter((call) => call.type === "RETRY_JOB_ITEM")
+  )).toEqual([{ type: "RETRY_JOB_ITEM", jobId: "job-failed", failureId: "fail-b" }]);
+});
+
+test("页面诊断包装 fetch 后页面请求不受影响，只记录字段名与类型名", async () => {
+  await launchExtension();
+  const page = await context.newPage();
+  await page.route("https://example.test/**", (route) => {
+    if (route.request().url().includes("/api/team/list")) {
+      return route.fulfill({ contentType: "application/json", body: JSON.stringify({
+        code: 0, data: { list: [{ name: "secret_name.png", pageId: "abcdef0123456789abcdef", size: 12 }] }
+      }) });
+    }
+    return route.fulfill({ contentType: "text/html", body: "<!doctype html><html><body></body></html>" });
+  });
+  await page.goto("https://example.test/team/pc/test/pageDetail/folder");
+  await page.addScriptTag({ path: resolve(projectRoot, "page-api.js") });
+  const result = await page.evaluate(async () => {
+    const body = await fetch("/api/team/list?token=secret").then((response) => response.json());
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const detail = await new Promise((resolve) => {
+      window.addEventListener("popo-stable-download:probe", (event) => resolve(event.detail), { once: true });
+      window.dispatchEvent(new Event("popo-stable-download:request-probe"));
+    });
+    return { body, detail };
+  });
+  expect(result.body.data.list[0].name).toBe("secret_name.png");
+  const apis = JSON.parse(result.detail).apis;
+  expect(apis).toHaveLength(1);
+  expect(apis[0].shape.data.list).toEqual([{ name: "string", pageId: "string", size: "number" }]);
+  expect(result.detail).not.toContain("secret_name");
+  expect(result.detail).not.toContain("abcdef0123456789");
+});
+
+test("页面诊断记录请求体字段名与 pageType 枚举组合，不记录值", async () => {
+  await launchExtension();
+  const page = await context.newPage();
+  await page.route("https://example.test/**", (route) => {
+    if (route.request().url().includes("/api/team/sub")) {
+      return route.fulfill({ contentType: "application/json", body: JSON.stringify({ data: { pageList: [
+        { pageId: "abc", pageName: "secret_folder", pageType: 1, hasChildren: 1 },
+        { pageId: "def", pageName: "secret.png", pageType: 3, hasChildren: 0 }
+      ] } }) });
+    }
+    return route.fulfill({ contentType: "text/html", body: "<!doctype html><html><body></body></html>" });
+  });
+  await page.goto("https://example.test/team/pc/test/pageDetail/folder");
+  await page.addScriptTag({ path: resolve(projectRoot, "page-api.js") });
+  const detail = await page.evaluate(async () => {
+    await fetch("/api/team/sub", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pageId: "secret-page-id", pageSize: 50 }) }).then((response) => response.json());
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    return new Promise((resolve) => {
+      window.addEventListener("popo-stable-download:probe", (event) => resolve(event.detail), { once: true });
+      window.dispatchEvent(new Event("popo-stable-download:request-probe"));
+    });
+  });
+  const payload = JSON.parse(detail);
+  expect(payload.apis[0].request).toEqual({ pageId: "string", pageSize: "number" });
+  expect(payload.enums.pageTypePairs.sort()).toEqual(["1|1", "3|0"]);
+  expect(detail).not.toContain("secret");
+});
+
+test("任务成功完成后列表里没有任务，页面仍通过完成凭证弹出带用时的提示", async () => {
+  await launchExtension();
+  const page = await context.newPage();
+  await page.route("https://example.test/**", (route) => route.fulfill({
+    contentType: "text/html", body: "<!doctype html><html><body></body></html>"
+  }));
+  await page.goto("https://example.test/team/pc/test/pageDetail/folder");
+  await page.setContent(`
+    <title>整页素材</title>
+    <div id="toolbar"><button><span>所有类型</span></button></div>
+    <div data-test-id="virtuoso-scroller"><div data-test-id="virtuoso-item-list" style="padding-bottom: 48px">
+      <div data-item-index="0" data-known-size="48" style="display:flex;width:900px;height:48px;align-items:center">
+        <div class="pageName" style="flex:1"><span class="drive-icon-folder"></span><span class="topName">马车鉴赏</span></div>
+        <div class="listMore"><button aria-label="更多">…</button></div>
+      </div></div></div>`);
+  await page.evaluate(() => {
+    const state = { jobs: [], folderReceipts: [], activeJobId: null, mode: "idle", popupOpen: false };
+    const runtime = {
+      getURL: () => "data:image/svg+xml,%3Csvg%3E%3C/svg%3E",
+      sendMessage: async (message) => {
+        if (message.type === "GET_STATE") return { ok: true, state: JSON.parse(JSON.stringify(state)), settings: {} };
+        if (message.type === "CHECK_GOPEED") return { ok: true, connection: { connected: true }, settings: {} };
+        return { ok: true, state: JSON.parse(JSON.stringify(state)) };
+      },
+      onMessage: { addListener() {}, removeListener() {} }
+    };
+    window.chrome = window.chrome || {};
+    Object.defineProperty(window.chrome, "runtime", { configurable: true, value: runtime });
+    window.__popoUiTest = { state };
+  });
+  await page.addScriptTag({ path: resolve(projectRoot, "runtime/page-ui.js") });
+  await expect(page.locator("#popo-react-page-root")).toHaveCount(1);
+  await expect(page.locator(".popo-toast")).toHaveCount(0);
+  await page.evaluate(() => {
+    window.__popoUiTest.state.folderReceipts.push({
+      key: "k1", parentUrl: "https://example.test/team/pc/test/pageDetail/folder", folderItemIndex: "0", folderName: "马车鉴赏",
+      completedAt: new Date().toISOString(), startedAt: new Date(Date.now() - 67000).toISOString(),
+      scanCompletedAt: new Date(Date.now() - 63000).toISOString(), scanVia: "api", counts: { files: 32, success: 32 }
+    });
+  });
+  const toast = page.locator(".popo-toast");
+  await expect(toast).toContainText("马车鉴赏");
+  await expect(toast).toContainText("已完成 32 个文件 · 扫描用时 4 秒（接口） · 下载用时 1 分 3 秒");
+  // 提示停留 10 秒，不会 3 秒就消失。
+  await page.waitForTimeout(4000);
+  await expect(toast).toHaveCount(1);
+});
+
+test("接口桥只放行 folderSubList 的模板请求体，其余路径、方法、字段被拒绝", async () => {
+  await launchExtension();
+  const page = await context.newPage();
+  const seen = [];
+  await page.route("https://example.test/**", (route) => {
+    const request = route.request();
+    if (request.url().includes("/page/folderSubList")) {
+      seen.push(JSON.parse(request.postData() || "{}"));
+      return route.fulfill({ contentType: "application/json", body: JSON.stringify({ status: 200, data: { pageList: [], more: false, total: 0 } }) });
+    }
+    return route.fulfill({ contentType: "text/html", body: "<!doctype html><html><body></body></html>" });
+  });
+  await page.goto("https://example.test/team/pc/test/pageDetail/folder");
+  await page.addScriptTag({ path: resolve(projectRoot, "page-api.js") });
+  const bridge = (message) => page.evaluate((payload) => new Promise((resolve) => {
+    const requestId = Math.random().toString(36).slice(2);
+    const onMessage = (event) => {
+      if (event.source !== window || event.data?.source !== "popo-stable-downloader-page" || event.data.requestId !== requestId) return;
+      window.removeEventListener("message", onMessage);
+      resolve(event.data);
+    };
+    window.addEventListener("message", onMessage);
+    window.postMessage({ source: "popo-stable-downloader-isolated", requestId, ...payload }, location.origin);
+  }), message);
+  const path = "/api/bs-team-space/web/v1/page/folderSubList";
+
+  // 页面还没发过同接口请求：没有模板，不发请求。
+  const noTemplate = await bridge({ method: "POST", path, body: { pageId: "child", teamSpaceId: "ts" } });
+  expect(noTemplate).toMatchObject({ ok: false, status: 0, error: "no_template" });
+  expect(seen).toHaveLength(0);
+
+  // 页面自己发一次，扩展记下其中的数字与布尔字段。
+  await page.evaluate(async (apiPath) => {
+    await fetch(apiPath, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pageId: "root", teamSpaceId: "ts", folderPriority: 1, sortField: 3, isAsc: true, pageMajorVersion: 7 }) });
+  }, path);
+  seen.length = 0;
+
+  const ok = await bridge({ method: "POST", path, body: { pageId: "child", teamSpaceId: "ts", pageMajorVersion: 2, evil: "x" } });
+  expect(ok).toMatchObject({ ok: true, status: 200 });
+  expect(seen).toEqual([{ pageId: "child", teamSpaceId: "ts", folderPriority: 1, sortField: 3, isAsc: true, pageMajorVersion: 2 }]);
+
+  expect(await bridge({ method: "POST", path: "/api/other/thing", body: { pageId: "a", teamSpaceId: "b" } })).toMatchObject({ ok: false, status: 403 });
+  expect(await bridge({ method: "DELETE", path, body: { pageId: "a", teamSpaceId: "b" } })).toMatchObject({ ok: false, status: 403 });
+  expect(await bridge({ method: "POST", path, body: { pageId: "", teamSpaceId: "b" } })).toMatchObject({ ok: false, status: 400 });
+  expect(await bridge({ method: "POST", path, body: { pageId: 5, teamSpaceId: "b" } })).toMatchObject({ ok: false, status: 400 });
+  expect(seen).toHaveLength(1);
+});
+
+test("页面诊断只读取同源 /api/ JSON 响应，同一接口只解析一次，非接口请求不克隆", async () => {
+  await launchExtension();
+  const page = await context.newPage();
+  await page.route("https://example.test/**", (route) => {
+    const url = route.request().url();
+    if (url.includes("/api/team/list")) return route.fulfill({ contentType: "application/json", body: JSON.stringify({ code: 0 }) });
+    if (url.includes("/api/team/blob")) return route.fulfill({ contentType: "application/octet-stream", body: "x".repeat(2000) });
+    if (url.includes("/static/")) return route.fulfill({ contentType: "text/plain", body: "asset" });
+    return route.fulfill({ contentType: "text/html", body: "<!doctype html><html><body></body></html>" });
+  });
+  await page.goto("https://example.test/team/pc/test/pageDetail/folder");
+  await page.evaluate(() => {
+    window.__clones = 0;
+    const original = Response.prototype.clone;
+    Response.prototype.clone = function () { window.__clones += 1; return original.call(this); };
+  });
+  await page.addScriptTag({ path: resolve(projectRoot, "page-api.js") });
+  const clones = await page.evaluate(async () => {
+    await fetch("/static/app.js").then((response) => response.text());
+    await fetch("/api/team/blob").then((response) => response.text());
+    await fetch("/api/team/list").then((response) => response.json());
+    await fetch("/api/team/list").then((response) => response.json());
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    return window.__clones;
+  });
+  expect(clones).toBe(1);
+});
+
 test("Dev popup shows the successful sync batch while Stable stays unmarked", async () => {
   const manifestPath = join(extensionDir, "manifest.json");
   const markerPath = join(extensionDir, "dev-sync.json");

@@ -1,3 +1,9 @@
+/**
+ * [INPUT]: 接收页面字符串、目录列表与扩展命令。
+ * [OUTPUT]: 导出名称、路径、地址与后台命令校验规则。
+ * [POS]: 页面和后台共享的纯规则；不执行 I/O。
+ * [PROTOCOL]: Update this header on change, then check AGENTS.md
+ */
 (function initPopoCore(root) {
   "use strict";
 
@@ -443,6 +449,7 @@
     "GET_STATE",
     "GET_UPDATE_STATUS",
     "GET_UPDATE_DIAGNOSTICS",
+    "GET_PAGE_PROBE",
     "CHECK_GOPEED",
     "CANCEL_FOLDER_TASK",
     "START_DOWNLOAD",
@@ -457,6 +464,7 @@
   const JOB_RUNTIME_COMMANDS = new Set([
     "CANCEL_JOB",
     "RETRY_JOB",
+    "RETRY_JOB_ITEM",
     "DISMISS_JOB",
     "RESTORE_CANCELLED_JOB"
   ]);
@@ -479,7 +487,7 @@
     gopeedConnections: [1, 16],
     maxRetries: [0, 10]
   });
-  const SETTINGS_BOOLEAN_FIELDS = new Set(["recursive", "preserveStructure"]);
+  const SETTINGS_BOOLEAN_FIELDS = new Set(["recursive", "preserveStructure", "useApiScan"]);
   const SETTINGS_TIMEOUT_FIELDS = new Set([
     "directoryLoad",
     "scanList",
@@ -597,6 +605,9 @@
 
     if (JOB_RUNTIME_COMMANDS.has(type)) {
       command.jobId = boundedMessageString(message.jobId, "jobId", 200);
+      if (type === "RETRY_JOB_ITEM") {
+        command.failureId = boundedMessageString(message.failureId, "failureId", 32768);
+      }
       if (type === "RESTORE_CANCELLED_JOB" && message.sourceTabId != null) {
         if (!Number.isInteger(message.sourceTabId) || message.sourceTabId < 0) {
           throw runtimeMessageError("sourceTabId");
@@ -667,6 +678,11 @@
           pageName: boundedMessageString(message.pageName, "pageName", 1024),
           parentUrl: normalizePopoPageUrl(message.parentUrl, "parentUrl")
         };
+      case "PAGE_PROBE_REPORT":
+        if (!isPlainRecord(message.report) || JSON.stringify(message.report).length > 100000) {
+          throw runtimeMessageError("report");
+        }
+        return { type, report: message.report };
       case "SOURCE_PAGE_READY":
       case "REGISTER_WORKER_FRAME":
         return { type, url: normalizePopoPageUrl(message.url, "url") };
@@ -678,6 +694,14 @@
   function csvEscape(value) {
     const text = String(value == null ? "" : value);
     return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  }
+
+  // 虚拟列表的行号在一个目录内唯一。按行号记录，后读到的行覆盖先读到的行：
+  // 进入子目录后上一层的残留行会被新目录的同号行替换，不再多计一项。
+  function collectScannedRow(rows, item) {
+    const index = String(item?.itemIndex ?? "");
+    rows.set(index ? `index\u0000${index}` : `${item.type}\u0000\u0000${item.name}`, item);
+    return rows;
   }
 
   function verifyDirectoryItemCount(expectedValue, actualValue) {
@@ -739,6 +763,7 @@
     resolveDownloadFilename,
     sanitizePathSegment,
     selectObservedDownloadUrl,
+    collectScannedRow,
     selectVirtualListMatch,
     splitTokens,
     validateDownloadUrl,

@@ -1,3 +1,9 @@
+/**
+ * [INPUT]: 依赖 core、queue、Gopeed 与 runtime 的契约、恢复和存储能力。
+ * [OUTPUT]: 接收扩展命令并持久化下载队列与失败恢复状态。
+ * [POS]: MV3 后台调度入口；页面读取交给 content，文件传输交给 Gopeed。
+ * [PROTOCOL]: Update this header on change, then check AGENTS.md
+ */
 importScripts("runtime/popo-runtime.js", "core.js", "gopeed.js", "queue.js");
 
 "use strict";
@@ -87,6 +93,14 @@ const MAX_RETAINED_FOLDER_RECEIPTS = 500;
 const FOLDER_RECEIPT_FEEDBACK_MS = 2 * 60 * 1000;
 const DOWNLOAD_RECEIPT_VERIFICATION_VERSION = 1;
 const MAX_DIRECTORY_RESOLVE_RETRIES = 2;
+// 文件准备失败后的退避：第 1 次 3 秒，之后 10 秒；期间先处理其他文件。
+const PREPARE_RETRY_BACKOFF_MS = [3000, 10000];
+// 直接打开目录地址后，等待页面标题确认目录身份的上限。
+const DIRECT_DIRECTORY_CONFIRM_MS = 3000;
+// 返回目录最多等这么久；超时回退完整加载。
+const RETURN_TO_DIRECTORY_MAX_MS = 8000;
+// 接口扫描同时列出的同级目录数；每个目录一次接口请求，与用户在页面上快速浏览的量级相同。
+const API_SCAN_CONCURRENCY = 4;
 const WORKER_UNAVAILABLE_CODE = "POPO_WORKER_UNAVAILABLE";
 const POPUP_UI_PORT_NAME = "popo-popup-ui";
 const MIN_DOWNLOAD_CONCURRENCY = 1;
@@ -120,6 +134,9 @@ const runtimeContracts = globalThis.PopoRuntime?.contracts || null;
 const runtimeDiagnostics = globalThis.PopoRuntime?.diagnostics || null;
 const runtimeNetworkMonitor = globalThis.PopoRuntime?.networkMonitor || null;
 const runtimeTaskStore = globalThis.PopoRuntime?.taskStore || null;
+const runtimeDownloadRecovery = globalThis.PopoRuntime?.downloadRecovery;
+const runtimeDirectorySummary = globalThis.PopoRuntime?.directorySummary;
+const runtimeApiScan = globalThis.PopoRuntime?.apiScan;
 const runtimeWorkflow = globalThis.PopoRuntime?.workflow || null;
 let automaticUpdateLocked = false;
 let updateHandoffRecoveryLocked = false;
@@ -128,6 +145,13 @@ let diagnosticFlushLocked = false;
 const DIAGNOSTIC_EVENT_CODES = new Set([
   "BACKGROUND_UNCAUGHT_ERROR",
   "DOWNLOAD_ATTEMPT_FAILED",
+  "API_SCAN_FALLBACK",
+  "AUTO_RETRY_QUEUED",
+  "DIRECTORY_SCAN_RETRY",
+  "DIRECTORY_SCAN_FAILED",
+  "DIRECTORY_RESOLVE_RETRY",
+  "DIRECTORY_RESOLVE_FAILED",
+  "DOWNLOAD_ITEM_RETRY_REQUESTED",
   "DOWNLOAD_PERMISSION_DENIED",
   "DOWNLOAD_STALLED",
   "GOPEED_DATA_INVALID",
@@ -154,11 +178,13 @@ function enforceRuntimeCommandContract(command) {
   }
 }
 
+const PAGE_PROBE_KEY = "popoPageProbe";
 const POPO_PAGE_COMMANDS = new Set([
   "START_FOLDER_SCAN",
   "START_PAGE_DOWNLOAD",
   "SOURCE_PAGE_READY",
-  "REGISTER_WORKER_FRAME"
+  "REGISTER_WORKER_FRAME",
+  "PAGE_PROBE_REPORT"
 ]);
 
 function assertTrustedRuntimeSource(command, sender) {
@@ -420,6 +446,9 @@ function normalizeFolderReceipts(receipts) {
       folderItemIndex,
       folderName,
       completedAt: String(source.completedAt || ""),
+      startedAt: String(source.startedAt || ""),
+      scanCompletedAt: String(source.scanCompletedAt || ""),
+      scanVia: ["api", "page", "mixed"].includes(source.scanVia) ? source.scanVia : "",
       counts: {
         files: Math.max(0, Number(source.counts?.files) || 0),
         discoveredFiles: Math.max(0, Number(source.counts?.discoveredFiles) || 0),
@@ -450,8 +479,8 @@ function verifiedFolderReceipt(state, job) {
   const reconciliation = quantityReconciliation(state);
   const counts = reconciliation.counts;
   const summary = job.counts || {};
-  const selected = Math.max(0, Number(counts.selected) || 0);
-  const success = Math.max(0, Number(counts.success) || 0);
+  const selected = Math.max(0, Number(counts.selected) || 0) + (Number(job.retainedCounts?.files) || 0);
+  const success = Math.max(0, Number(counts.success) || 0) + (Number(job.retainedCounts?.success) || 0);
   const hasIncompleteFiles = [
     counts.pending,
     counts.preparing,
@@ -479,6 +508,9 @@ function verifiedFolderReceipt(state, job) {
     folderItemIndex: String(job.folderItemIndex),
     folderName: String(job.folderName),
     completedAt: state.completedAt || new Date().toISOString(),
+    startedAt: String(job.startedAt || ""),
+    scanCompletedAt: String(job.scanCompletedAt || ""),
+    scanVia: job.scanVia || "",
     counts: {
       files: selected,
       discoveredFiles: Math.max(0, Number(summary.discoveredFiles) || 0),
@@ -524,6 +556,8 @@ const DEFAULT_SETTINGS = Object.freeze({
   excludeKeywords: "",
   downloadRoot: "POPO稳定下载",
   preserveStructure: true,
+  // 用 POPO 目录接口扫描并按文件 ID 取址；任何不确定都回退页面流程。
+  useApiScan: true,
   concurrency: 5,
   gopeedEndpoint: "http://127.0.0.1:9999",
   gopeedToken: "",
@@ -641,6 +675,7 @@ function newState() {
     scanQueue: [],
     resolveQueue: [],
     scanFailures: [],
+    directoryScans: [],
     scannedFolderCount: 0,
     rootProjectCount: null,
     items: [],
@@ -1025,18 +1060,51 @@ function syncActiveJobSummary(state) {
       state.scannedFolderCount,
       state.scanFailures?.length
     );
+    job.directories = runtimeDirectorySummary.summarizeDirectories(
+      state.directoryScans || [], state.items || [], state.scanFailures || []
+    );
     const workflowCounts = refreshPersistentWorkflowCounts(state);
     job.counts.handedOff = workflowCounts.handedOff;
     job.counts.verifiedDirectories = workflowCounts.verifiedDirectories;
     job.counts.unverifiedDirectories = workflowCounts.unverifiedDirectories;
     job.counts.scanRetries = workflowCounts.scanRetries;
-    job.failurePreview = (state.items || [])
-      .filter((item) => item.status === "failed")
+    const failures = [
+      ...(state.items || []).filter((item) => item.status === "failed").map((item) => ({
+        id: encodeURIComponent(item.id), kind: "file", name: item.name, path: item.directoryPath || [],
+        stage: item.failureStage, error: item.error, reason: item.failureReason,
+        retryKey: storedItemRetryKey(item),
+        url: item.parentUrl, rootUrl: item.rootUrl || state.rootUrl,
+        route: normalizeDirectoryRoute(item.directoryRoute)
+      })),
+      ...(state.scanFailures || []).map((failure) => ({
+        ...failure, id: `directory:${JSON.stringify([failure.url, failure.path])}`,
+        kind: "directory", name: failure.path?.at(-1) || job.folderName,
+        path: failure.path || [], rootUrl: failure.rootUrl || state.rootUrl,
+        route: Array.isArray(failure.route) ? normalizeDirectoryRoute(failure.route) : undefined,
+        knownCounts: {
+          ...summarizeItems((state.items || []).filter((item) =>
+            (failure.path || []).length > 0 && failure.path.every((part, index) => item.directoryPath?.[index] === part)
+          ), 0, 0),
+          scanFailures: state.scanFailures.filter((entry) =>
+            (failure.path || []).length > 0 && failure.path.every((part, index) => entry.path?.[index] === part)
+          ).length,
+          unverifiedDirectories: state.scanFailures.filter((entry) =>
+            (failure.path || []).length > 0 && failure.path.every((part, index) => entry.path?.[index] === part)
+          ).length
+        }
+      }))
+    ];
+    const recovery = runtimeDownloadRecovery.mergeRecoverySummary(job, job.counts, failures, state.items || []);
+    job.counts = recovery.counts;
+    // 明细只保存前 200 条；批量重试键取全部失败文件，不受上限影响。
+    const cappedFailures = runtimeDownloadRecovery.capFailureEntries(recovery.failures);
+    job.failureEntries = cappedFailures.entries;
+    job.failureEntriesOmitted = cappedFailures.omitted;
+    job.failurePreview = job.failureEntries
       .slice(0, 6)
-      .map((item) => ({ name: item.name, stage: item.failureStage, error: item.error }));
-    job.failureRetryKeys = [...new Set((state.items || [])
-      .filter((item) => item.status === "failed")
-      .map(storedItemRetryKey))];
+      .map((item) => ({ name: item.name, stage: item.stage, error: item.error }));
+    job.failureRetryKeys = [...new Set(recovery.failures
+      .filter((entry) => entry.kind === "file").map((entry) => entry.retryKey).filter(Boolean))];
     job.cancelledRetryKeys = [...new Set((state.items || [])
       .filter((item) => item.status === "cancelled")
       .map(storedItemRetryKey))];
@@ -1162,7 +1230,9 @@ async function persistPendingDiagnostics(state) {
       transferring: Number(job?.counts?.transferring) || 0,
       activeTransfers: (state.activeTransfers || []).length,
       scanQueue: (state.scanQueue || []).length,
-      resolveQueue: (state.resolveQueue || []).length
+      resolveQueue: (state.resolveQueue || []).length,
+      scanFailures: Number(job?.counts?.scanFailures) || 0,
+      unverifiedDirectories: Number(job?.counts?.unverifiedDirectories) || 0
     }
   };
   let written = 0;
@@ -2015,6 +2085,7 @@ async function registerWorkerFrame(sender, url) {
   if (!job || state.triggerMode !== "folder_button" || job.sourceTabId !== tabId) return null;
   state.workerFrameId = frameId;
   state.workerReadyUrl = url;
+  state.workerAtDirectoryKey = null;
   state.workerRecoveryPending = false;
   state.workerSourceTabId = tabId;
   state.workerDeadline = 0;
@@ -2309,6 +2380,56 @@ async function navigateDirectoryRoute(state, rootUrl, route, timeoutMs) {
   return context;
 }
 
+function pageDetailId(url) {
+  return String(url || "").match(/\/pageDetail\/([a-z0-9]+)/i)?.[1] || "";
+}
+
+// 目录有独立地址时直接加载它，省去“重载根目录再逐层点击”。
+// 地址或目录名对不上、或加载出错时，回退到逐层进入；页面工作区中断照常上抛。
+async function openDirectory(state, target, timeoutMs) {
+  const route = normalizeDirectoryRoute(target.route);
+  const directId = target.direct && route.length ? pageDetailId(target.url) : "";
+  if (directId && directId !== pageDetailId(target.rootUrl)) {
+    const expectedName = route[route.length - 1].name;
+    let detail = "目录身份未确认";
+    try {
+      await loadWorkUrl(state, target.url, state.settings.timeouts.directoryLoad, true);
+      const deadline = Date.now() + DIRECT_DIRECTORY_CONFIRM_MS;
+      while (true) {
+        const context = await getWorkDirectoryContext(state);
+        if (pageDetailId(context.url) === directId &&
+            (!context.directoryName || context.directoryName === expectedName)) return context;
+        if (Date.now() >= deadline) break;
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+    } catch (error) {
+      if (isWorkerUnavailableError(error)) throw error;
+      detail = String(error);
+    }
+    pushLog(state, "warn", `目录直达未确认，改为逐层进入：${expectedName}`, detail);
+  }
+  return navigateDirectoryRoute(state, target.rootUrl, route, timeoutMs);
+}
+
+function directoryRouteKey(item) {
+  return JSON.stringify([item.rootUrl || "", item.directoryRoute || [], item.parentUrl || ""]);
+}
+
+// 从文件预览页回到同一个目录。目录名与地址都对得上才算成功；否则调用方回退完整加载。
+async function returnToDirectory(state, item, timeoutMs) {
+  const expectedName = item.directoryPath?.at(-1) || "";
+  if (!expectedName) return false;
+  await sendToWork(state, { type: "RETURN_TO_DIRECTORY", timeoutMs }, timeoutMs + 3000, "返回目录");
+  const deadline = Date.now() + DIRECT_DIRECTORY_CONFIRM_MS;
+  while (true) {
+    const context = await getWorkDirectoryContext(state);
+    if (context.directoryName === expectedName &&
+        pageDetailId(context.url) === pageDetailId(item.parentUrl)) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+}
+
 function schedulePump(delayMs = 500) {
   chrome.alarms.create(PUMP_ALARM, { when: Date.now() + Math.max(100, delayMs) });
 }
@@ -2320,6 +2441,11 @@ function clearEngineFields(state) {
   state.scanQueue = [];
   state.resolveQueue = [];
   state.scanFailures = [];
+  state.directoryScans = [];
+  state.apiScanQueue = [];
+  state.apiScanStarted = false;
+  state.apiScanDisabled = false;
+  state.workerAtDirectoryKey = null;
   state.scannedFolderCount = 0;
   state.rootProjectCount = null;
   state.items = [];
@@ -2377,6 +2503,14 @@ function prepareJobForExecution(state, job, reuseWorker) {
       itemIndex: job.folderItemIndex
     }];
   }
+  if (job.retrySelection) {
+    const failure = job.retrySelection;
+    state.scanQueue = [{
+      url: failure.url, path: failure.path,
+      rootUrl: failure.rootUrl || job.parentUrl, route: failure.route
+    }];
+    state.resolveQueue = [];
+  }
   state.startedAt = new Date().toISOString();
   state.completedAt = "";
   state.settings = mergeSettings({
@@ -2427,6 +2561,7 @@ async function requestWorkerFrameForActiveJob(state) {
 }
 
 async function waitForWorkerReconnect(state, message, reason = "worker_frame_missing") {
+  state.workerAtDirectoryKey = null;
   const now = Date.now();
   state.workerRecoveryStartedAt ||= now;
   const newEpisode = !state.workerRecoveryPending;
@@ -2452,10 +2587,23 @@ async function waitForWorkerReconnect(state, message, reason = "worker_frame_mis
       item.stage = "页面恢复超限";
       item.failureStage = FAILURE.DIRECTORY_LOAD_FAILED;
       item.error = reason;
+      item.failureReason = "worker_recovery_exhausted";
       item.completedAt = new Date().toISOString();
     }
+    // 接口扫描队列里还没列出的目录逐个记为失败，补下时可以单独重试。
+    for (const apiEntry of state.apiScanQueue || []) {
+      state.scanFailures.push({
+        url: apiEntry.url, path: apiEntry.path, rootUrl: state.rootUrl, route: apiEntry.route,
+        stage: FAILURE.DIRECTORY_LOAD_FAILED, error: reason,
+        reason: "worker_recovery_exhausted", at: new Date().toISOString()
+      });
+    }
+    state.apiScanQueue = [];
     if (state.scanQueue.length || state.resolveQueue.length) {
-      state.scanFailures.push({ path: [], stage: FAILURE.DIRECTORY_LOAD_FAILED, error: reason, at: new Date().toISOString() });
+      state.scanFailures.push({
+        path: [], stage: FAILURE.DIRECTORY_LOAD_FAILED, error: reason,
+        reason: "worker_recovery_exhausted", at: new Date().toISOString()
+      });
     }
     state.scanQueue = [];
     state.resolveQueue = [];
@@ -2564,6 +2712,12 @@ async function repairQueueState(state) {
 async function finalizeActiveJob(state, status, message, notification = null, force = false) {
   const job = activeJob(state);
   if (!job) return null;
+  syncActiveJobSummary(state);
+  if (status === "complete" && (job.failureEntries?.length || directoryIssueCount(job))) {
+    status = "failed";
+    message = "本次补下已结束，仍有未完成项；可在失败明细中继续重试";
+    if (notification) notification = { ...notification, type: "FOLDER_TASK_ERROR", message };
+  }
   if (status === "failed" && job.batchId) {
     const remainingCount = (state.jobs || []).filter((candidate) =>
       candidate.id !== job.id && candidate.batchId === job.batchId &&
@@ -2598,6 +2752,18 @@ async function finalizeActiveJob(state, status, message, notification = null, fo
     lastMessage: message
   });
   successfulDownloadRecordCache.delete(job.id);
+  // 只有原始任务自动补一轮；补下任务（自动或手动）失败后交给用户。
+  if (status === "failed" && !job.cancelRequested && !job.retryOfJobId &&
+      (job.failureEntries || []).some((entry) => runtimeDownloadRecovery.isAutoRetryable(entry))) {
+    // 自动补一轮：入队后由 transitionToNextQueuedJob 按队列顺序接续，同批后续任务不被阻塞。
+    const autoRetry = buildRetryJob(state, job, { auto: true });
+    if (autoRetry) {
+      state.jobs.push(autoRetry);
+      pushRuntimeEvent(state, "AUTO_RETRY_QUEUED", "info", "失败项已自动加入补下队列", "", {
+        jobId: autoRetry.id, reason: "auto_retry"
+      });
+    }
+  }
   if (status === "complete") recordVerifiedFolderReceipt(state, job);
   const source = {
     sourceTabId: state.sourceTabId,
@@ -2622,6 +2788,232 @@ function existingFolderJobCoveredByPageDownload(state, currentJob, entry, scanne
   });
 }
 
+// 由一次目录扫描得到的文件建立条目；页面扫描与接口扫描共用，接口条目另带 pageId。
+function appendScannedFile(state, entry, directoryPath, scanned, { key, pageId = "" }) {
+  if (state.items.some((item) => item.id === key)) return;
+  const systemMetadata = isSystemMetadataFile(scanned.name);
+  const currentJob = activeJob(state);
+  const retryKeys = currentJob?.retryKeys;
+  const retryKey = discoveredItemRetryKey(entry.url, directoryPath, scanned.name);
+  const legacyRetryKey = `${entry.url}\u0000${scanned.name}`;
+  const selection = currentJob?.retrySelection;
+  // 单文件补下：行号标识会随页面变化，所以除标识外也按“名称 + 目录路径”匹配。
+  const retrySelected = selection?.kind === "file"
+    ? encodeURIComponent(key) === selection.id ||
+      (scanned.name === selection.name && JSON.stringify(directoryPath) === JSON.stringify(selection.path))
+    : !retryKeys?.length || retryKeys.includes(retryKey) || retryKeys.includes(legacyRetryKey);
+  const candidateItem = {
+    id: key,
+    name: scanned.name,
+    itemIndex: scanned.itemIndex,
+    parentUrl: entry.url,
+    directoryPath
+  };
+  const relativeTargetKey = normalizeGopeedTargetKey(
+    assignedDownloadFilename(state, candidateItem)
+  );
+  const alreadyInGopeed = currentJob?.restoreStrategy === "missing_from_gopeed" &&
+    currentJob.existingGopeedTargetKeys?.includes(relativeTargetKey);
+  // 用户选择的是整个文件夹：除系统元数据外，不按扩展名或关键词跳过文件。
+  const selected = !systemMetadata && retrySelected && !alreadyInGopeed;
+  state.items.push({
+    ...candidateItem,
+    ...(pageId ? { pageId } : {}),
+    rootUrl: entry.rootUrl || state.rootUrl || entry.url,
+    directoryRoute: normalizeDirectoryRoute(entry.route),
+    directoryDirect: Boolean(entry.direct),
+    retryKey,
+    selected,
+    status: selected ? "pending" : "skipped",
+    stage: "已扫描",
+    failureStage: "",
+    error: selected
+      ? ""
+      : systemMetadata
+        ? "系统元数据文件已自动忽略"
+        : !retrySelected
+          ? "不属于本次恢复或失败重试"
+          : alreadyInGopeed
+            ? "Gopeed 已有相同保存路径的完成或进行中任务，恢复时不重复下载"
+            : "未通过筛选条件",
+    attempts: 0,
+    gopeedTaskId: null,
+    retryTaskId: null,
+    startedAt: "",
+    completedAt: "",
+    history: []
+  });
+}
+
+// ── 接口扫描：用 folderSubList 列目录并按文件 ID 建立条目。任何不确定都回退页面扫描。
+function apiScanEnabled(state) {
+  return state.settings?.useApiScan !== false && !state.apiScanDisabled &&
+    state.triggerMode === "folder_button" && activeJob(state)?.scope !== "page";
+}
+
+function recordApiScanFallback(state, reason, counts = {}) {
+  pushRuntimeEvent(state, "API_SCAN_FALLBACK", "warn", "接口扫描不可用，回退页面扫描", "", {
+    jobId: activeJob(state)?.id || "", reason,
+    more: Number(counts.more) || 0, total: Number(counts.total) || 0, length: Number(counts.length) || 0,
+    businessStatus: Number(counts.status) || 0, httpStatus: Number(counts.httpStatus) || 0,
+    detail: String(counts.detail || "").slice(0, 80)
+  });
+}
+
+async function listFolderByApi(state, pageId, pageMajorVersion) {
+  const teamSpaceId = await ensureTeamSpaceId(state);
+  const timeoutMs = state.settings.timeouts.downloadStart;
+  const response = await sendToWork(state, {
+    type: "LIST_FOLDER", teamSpaceId, pageId, pageMajorVersion, timeoutMs
+  }, timeoutMs + 3000, "读取目录接口");
+  if (!response?.ok) {
+    return {
+      ok: false, reason: "api_error", more: 0, total: 0, length: 0, status: 0,
+      httpStatus: Number(response?.status) || 0, detail: String(response?.error || "").slice(0, 80)
+    };
+  }
+  const parsed = runtimeApiScan.parseFolderSubList(response.body);
+  return parsed.ok ? parsed : { ...parsed, httpStatus: Number(response.status) || 0 };
+}
+
+// 把一个目录的接口列表结果写入状态：成功则建立条目并把子目录排进队列，失败则该目录转页面扫描。
+function applyApiListing(state, job, entry, listing) {
+  // 空列表不可信：目录声称有子项，或补下任务无法确认目录版本时，交给页面扫描核对。
+  if (listing.ok && listing.total === 0 && (entry.hasChildren === 1 || job.retryOfJobId)) {
+    listing = { ok: false, reason: "empty_unverified", more: 0, total: 0, length: 0 };
+  }
+  if (!listing.ok) {
+    // 这个目录交给页面扫描；其余已扫目录的条目保留。
+    recordApiScanFallback(state, listing.reason, listing);
+    state.scanQueue.push({ url: entry.url, path: entry.path, rootUrl: state.rootUrl, route: entry.route, direct: true });
+  } else {
+    const source = { url: entry.url, rootUrl: state.rootUrl, route: entry.route, direct: true };
+    for (const file of listing.files) {
+      appendScannedFile(state, source, entry.path, { name: file.name, itemIndex: "" }, {
+        key: discoveredItemId(entry.url, entry.path, file.pageId, file.name), pageId: file.pageId
+      });
+    }
+    for (const folder of listing.folders) {
+      state.scannedFolderCount += 1;
+      // 单文件补下只需要这个目录；递归子目录会白白增加请求，还可能因子目录回退误判失败。
+      if (!state.settings.recursive || job?.retrySelection?.kind === "file") continue;
+      state.apiScanQueue.push({
+        pageId: folder.pageId, pageMajorVersion: folder.pageMajorVersion, path: [...entry.path, folder.name],
+        url: runtimeApiScan.pageUrlFor(state.rootUrl, folder.pageId), hasChildren: folder.hasChildren,
+        route: [...(entry.route || []), { name: folder.name, itemIndex: "" }]
+      });
+    }
+    state.directoryScans = [
+      ...(state.directoryScans || []).filter((record) => JSON.stringify(record.path) !== JSON.stringify(entry.path)),
+      { path: entry.path, expected: listing.total, found: listing.total, verified: true, via: "api" }
+    ];
+    if (entry.path.length === 1 && entry.path[0] === state.selectedFolderName) {
+      state.rootProjectCount = listing.total;
+      if (job) job.projectCount = listing.total;
+    }
+    updatePersistentWorkflow(state, {
+      nextAction: selectedPendingItem(state) ? "handoff" : "scan",
+      counts: { verifiedDirectories: state.workflow.counts.verifiedDirectories + 1 }
+    });
+    pushLog(state, "info", `目录完成（接口）：${entry.path.join("/")}（${listing.total} 项）`);
+  }
+}
+
+// 把接口扫描队列里剩下的目录交给页面扫描，并关闭本任务的接口扫描。
+function disableApiScan(state, extraEntries = []) {
+  for (const entry of [...extraEntries, ...(state.apiScanQueue || [])]) {
+    state.scanQueue.push({ url: entry.url, path: entry.path, rootUrl: state.rootUrl, route: entry.route, direct: true });
+  }
+  state.apiScanQueue = [];
+  state.apiScanDisabled = true;
+}
+
+// 返回 true 表示本次 pump 已处理接口扫描；false 表示继续页面扫描。
+async function processApiScanStep(state) {
+  state.apiScanQueue = Array.isArray(state.apiScanQueue) ? state.apiScanQueue : [];
+  if (!apiScanEnabled(state)) {
+    // 中途被关闭（设置或回退）：队列里的目录不能丢，转页面扫描。
+    if (state.apiScanQueue.length) disableApiScan(state);
+    return false;
+  }
+  const job = activeJob(state);
+  let unprocessed = [];
+  try {
+    if (!state.apiScanQueue.length) {
+      if (state.apiScanStarted) return false;
+      state.apiScanStarted = true;
+      if (job.retrySelection) {
+        const entry = state.scanQueue[0];
+        const pageId = entry ? pageDetailId(entry.url) : "";
+        if (!pageId || pageId === pageDetailId(state.rootUrl)) {
+          recordApiScanFallback(state, "no_page_id");
+          state.apiScanDisabled = true;
+          return false;
+        }
+        state.scanQueue.shift();
+        state.apiScanQueue.push({
+          pageId, pageMajorVersion: undefined, path: entry.path, url: entry.url, route: entry.route || [], hasChildren: 0
+        });
+      } else {
+        const folder = state.resolveQueue.length === 1 ? state.resolveQueue[0] : null;
+        const parentPageId = folder && !folder.parentPath.length ? pageDetailId(folder.parentUrl) : "";
+        if (!parentPageId) {
+          recordApiScanFallback(state, "no_page_id");
+          state.apiScanDisabled = true;
+          return false;
+        }
+        const listing = await listFolderByApi(state, parentPageId);
+        const child = runtimeApiScan.findChildFolder(listing, folder.name);
+        if (!child) {
+          recordApiScanFallback(state, listing.ok ? "ambiguous_folder" : listing.reason, listing.ok ? {} : listing);
+          state.apiScanDisabled = true;
+          return false;
+        }
+        state.resolveQueue.shift();
+        state.apiScanQueue.push({
+          pageId: child.pageId, pageMajorVersion: child.pageMajorVersion, path: [folder.name],
+          url: runtimeApiScan.pageUrlFor(folder.parentUrl, child.pageId), hasChildren: child.hasChildren,
+          route: [{ name: folder.name, itemIndex: String(folder.itemIndex ?? "") }]
+        });
+      }
+    }
+    // 同级目录并行列出（上限 API_SCAN_CONCURRENCY）；结果按队列顺序写入，行为与逐个处理一致。
+    const batch = state.apiScanQueue.splice(0, API_SCAN_CONCURRENCY);
+    unprocessed = [...batch];
+    const listings = await Promise.all(batch.map(async (entry) => {
+      try {
+        return await listFolderByApi(state, entry.pageId, entry.pageMajorVersion);
+      } catch (error) {
+        if (isWorkerUnavailableError(error)) throw error;
+        return { ok: false, reason: "api_error", more: 0, total: 0, length: 0, status: 0, detail: "" };
+      }
+    }));
+    batch.forEach((entry, index) => {
+      applyApiListing(state, job, entry, listings[index]);
+      unprocessed.shift();
+    });
+    await saveState(state);
+    await notifySource(state, {
+      type: "FOLDER_TASK_STATUS",
+      message: `已发现 ${state.items.filter((item) => item.selected).length} 个可下载文件，继续读取子文件夹…`
+    });
+    schedulePump();
+    return true;
+  } catch (error) {
+    if (isWorkerUnavailableError(error)) {
+      state.apiScanQueue.unshift(...unprocessed);
+      await waitForWorkerReconnect(
+        state, "POPO 页面刷新中；当前目录稍后自动继续，不计为扫描失败", "worker_message_interrupted"
+      );
+      return true;
+    }
+    // 其余错误：整体回退页面扫描；正在处理的目录与队列里剩下的目录都转页面扫描，不丢。
+    recordApiScanFallback(state, "api_error");
+    disableApiScan(state, unprocessed);
+    return false;
+  }
+}
+
 async function processScanStep(state) {
   const settings = state.settings;
   state.phase = "scanning";
@@ -2637,6 +3029,8 @@ async function processScanStep(state) {
     return;
   }
 
+  if (await processApiScanStep(state)) return;
+
   if (state.scanQueue.length) {
     const entry = state.scanQueue[0];
     try {
@@ -2647,12 +3041,13 @@ async function processScanStep(state) {
         message: `正在读取：${entry.path.join("/") || state.selectedFolderName}`
       });
       if (entry.rootUrl || Array.isArray(entry.route)) {
-        await navigateDirectoryRoute(
-          state,
-          entry.rootUrl || state.rootUrl || entry.url,
-          entry.route || [],
-          settings.timeouts.fileOpen
-        );
+        const directoryContext = await openDirectory(state, {
+          rootUrl: entry.rootUrl || state.rootUrl || entry.url,
+          route: entry.route || [],
+          url: entry.url,
+          direct: entry.direct
+        }, settings.timeouts.fileOpen);
+        entry.url = directoryContext.url || entry.url;
       } else {
         await loadWorkUrl(state, entry.url, settings.timeouts.directoryLoad, true);
       }
@@ -2677,6 +3072,19 @@ async function processScanStep(state) {
       }
 
       const directoryPath = entry.path.length ? entry.path : [result.directoryName];
+      {
+        const scans = (state.directoryScans || []).filter(
+          (record) => JSON.stringify(record.path) !== JSON.stringify(directoryPath)
+        );
+        scans.push({
+          path: directoryPath,
+          expected: countCheck.verified ? countCheck.expected : null,
+          found: result.items.length,
+          verified: countCheck.verified,
+          via: "page"
+        });
+        state.directoryScans = scans;
+      }
       if (
         state.triggerMode === "folder_button" &&
         directoryPath.length === 1 &&
@@ -2709,7 +3117,7 @@ async function processScanStep(state) {
             continue;
           }
           state.scannedFolderCount += 1;
-          if (settings.recursive) {
+          if (settings.recursive && activeJob(state)?.retrySelection?.kind !== "file") {
             const resolveKey = discoveredItemId(
               entry.url,
               directoryPath,
@@ -2723,6 +3131,7 @@ async function processScanStep(state) {
                 parentUrl: entry.url,
                 parentPath: directoryPath,
                 parentRoute: normalizeDirectoryRoute(entry.route),
+                parentDirect: Boolean(entry.direct),
                 name: scanned.name,
                 itemIndex: scanned.itemIndex
               });
@@ -2730,56 +3139,19 @@ async function processScanStep(state) {
           }
           continue;
         }
-        const key = discoveredItemId(entry.url, directoryPath, scanned.itemIndex, scanned.name);
-        if (state.items.some((item) => item.id === key)) continue;
-        const systemMetadata = isSystemMetadataFile(scanned.name);
-        const currentJob = activeJob(state);
-        const retryKeys = currentJob?.retryKeys;
-        const retryKey = discoveredItemRetryKey(entry.url, directoryPath, scanned.name);
-        const legacyRetryKey = `${entry.url}\u0000${scanned.name}`;
-        const retrySelected = !retryKeys?.length ||
-          retryKeys.includes(retryKey) || retryKeys.includes(legacyRetryKey);
-        const candidateItem = {
-          id: key,
-          name: scanned.name,
-          itemIndex: scanned.itemIndex,
-          parentUrl: entry.url,
-          directoryPath
-        };
-        const relativeTargetKey = normalizeGopeedTargetKey(
-          assignedDownloadFilename(state, candidateItem)
-        );
-        const alreadyInGopeed = currentJob?.restoreStrategy === "missing_from_gopeed" &&
-          currentJob.existingGopeedTargetKeys?.includes(relativeTargetKey);
-        // 用户选择的是整个文件夹：除系统元数据外，不按扩展名或关键词跳过文件。
-        const selected = !systemMetadata && retrySelected && !alreadyInGopeed;
-        state.items.push({
-          ...candidateItem,
-          rootUrl: entry.rootUrl || state.rootUrl || entry.url,
-          directoryRoute: normalizeDirectoryRoute(entry.route),
-          retryKey,
-          selected,
-          status: selected ? "pending" : "skipped",
-          stage: "已扫描",
-          failureStage: "",
-          error: selected
-            ? ""
-            : systemMetadata
-              ? "系统元数据文件已自动忽略"
-              : !retrySelected
-                ? "不属于本次恢复或失败重试"
-                : alreadyInGopeed
-                  ? "Gopeed 已有相同保存路径的完成或进行中任务，恢复时不重复下载"
-                  : "未通过筛选条件",
-          attempts: 0,
-          gopeedTaskId: null,
-          retryTaskId: null,
-          startedAt: "",
-          completedAt: "",
-          history: []
+        appendScannedFile(state, entry, directoryPath, scanned, {
+          key: discoveredItemId(entry.url, directoryPath, scanned.itemIndex, scanned.name)
         });
       }
       state.scanQueue.shift();
+      if (!countCheck.verified) {
+        state.scanFailures.push({
+          url: entry.url, path: directoryPath, rootUrl: entry.rootUrl || state.rootUrl,
+          route: entry.route, stage: FAILURE.DIRECTORY_LOAD_FAILED,
+          error: "目录没有可独立核对的项目数量，请重新读取目录", reason: "count_unverified",
+          at: new Date().toISOString()
+        });
+      }
       const workflowCounts = state.workflow.counts;
       updatePersistentWorkflow(state, {
         nextAction: selectedPendingItem(state) ? "handoff" : "scan",
@@ -2826,12 +3198,29 @@ async function processScanStep(state) {
           schedulePump(300);
           return;
         }
+      } else {
+        entry.scanRetries = Math.max(0, Number(entry.scanRetries) || 0) + 1;
+        updatePersistentWorkflow(state, {
+          nextAction: "scan", counts: { scanRetries: state.workflow.counts.scanRetries + 1 }
+        });
+        if (entry.scanRetries <= MAX_DIRECTORY_RESOLVE_RETRIES) {
+          pushRuntimeEvent(state, "DIRECTORY_SCAN_RETRY", "warn",
+            `目录读取暂时失败，正在自动重扫（${entry.scanRetries}/${MAX_DIRECTORY_RESOLVE_RETRIES}）`, String(error),
+            { jobId: activeJob(state)?.id || "", failureStage: FAILURE.DIRECTORY_LOAD_FAILED,
+              retryCount: entry.scanRetries, reason: runtimeDownloadRecovery.classifyRecoveryError(error) });
+          await saveState(state);
+          schedulePump(500 * entry.scanRetries);
+          return;
+        }
       }
       state.scanFailures.push({
         url: entry.url,
         path: entry.path,
+        rootUrl: entry.rootUrl || state.rootUrl,
+        route: entry.route,
         stage: FAILURE.DIRECTORY_LOAD_FAILED,
         error: String(error),
+        reason: runtimeDownloadRecovery.classifyRecoveryError(error),
         at: new Date().toISOString()
       });
       state.scanQueue.shift();
@@ -2840,7 +3229,10 @@ async function processScanStep(state) {
         nextAction: selectedPendingItem(state) ? "handoff" : "scan",
         counts: { unverifiedDirectories: workflowCounts.unverifiedDirectories + 1 }
       });
-      pushLog(state, "error", `${FAILURE.DIRECTORY_LOAD_FAILED}：${entry.path.join("/") || entry.url}`, String(error));
+      pushRuntimeEvent(state, "DIRECTORY_SCAN_FAILED", "error",
+        `${FAILURE.DIRECTORY_LOAD_FAILED}：${entry.path.join("/") || entry.url}`, String(error),
+        { jobId: activeJob(state)?.id || "", failureStage: FAILURE.DIRECTORY_LOAD_FAILED,
+          retryCount: Number(entry.scanRetries || entry.countRetries) || 0, reason: runtimeDownloadRecovery.classifyRecoveryError(error) });
     }
     await saveState(state);
     await notifySource(state, {
@@ -2862,12 +3254,12 @@ async function processScanStep(state) {
       });
       const rootUrl = folder.rootUrl || state.rootUrl || folder.parentUrl;
       const parentRoute = normalizeDirectoryRoute(folder.parentRoute);
-      await navigateDirectoryRoute(
-        state,
+      await openDirectory(state, {
         rootUrl,
-        parentRoute,
-        settings.timeouts.fileOpen
-      );
+        route: parentRoute,
+        url: folder.parentUrl,
+        direct: folder.parentDirect
+      }, settings.timeouts.fileOpen);
       const childContext = await openDirectoryStep(
         state,
         { name: folder.name, itemIndex: folder.itemIndex },
@@ -2881,7 +3273,10 @@ async function processScanStep(state) {
         url: childContext.url,
         path: [...folder.parentPath, folder.name],
         rootUrl,
-        route: childRoute
+        route: childRoute,
+        // 进入后地址变了，说明该目录有独立地址，之后可以直接打开。
+        direct: Boolean(pageDetailId(childContext.url)) &&
+          pageDetailId(childContext.url) !== pageDetailId(folder.parentUrl)
       });
       state.resolveQueue.shift();
       updatePersistentWorkflow(state, {
@@ -2920,16 +3315,22 @@ async function processScanStep(state) {
       }
       state.scanFailures.push({
         url: folder.parentUrl,
+        rootUrl: folder.rootUrl || state.rootUrl || folder.parentUrl,
+        route: [...normalizeDirectoryRoute(folder.parentRoute), { name: folder.name, itemIndex: String(folder.itemIndex ?? "") }],
         path: [...folder.parentPath, folder.name],
         stage: FAILURE.DIRECTORY_LOAD_FAILED,
         error: String(error),
+        reason: runtimeDownloadRecovery.classifyRecoveryError(error),
         at: new Date().toISOString()
       });
       state.resolveQueue.shift();
       updatePersistentWorkflow(state, {
         nextAction: selectedPendingItem(state) ? "handoff" : "scan"
       });
-      pushLog(state, "error", `${FAILURE.DIRECTORY_LOAD_FAILED}：${folder.name}`, String(error));
+      updatePersistentWorkflow(state, { counts: { unverifiedDirectories: state.workflow.counts.unverifiedDirectories + 1 } });
+      pushRuntimeEvent(state, "DIRECTORY_RESOLVE_FAILED", "error", `${FAILURE.DIRECTORY_LOAD_FAILED}：${folder.name}`, String(error),
+        { jobId: activeJob(state)?.id || "", failureStage: FAILURE.DIRECTORY_LOAD_FAILED,
+          retryCount: folder.resolveRetries, reason: "directory_open_failed" });
     }
     await saveState(state);
     schedulePump();
@@ -2939,6 +3340,15 @@ async function processScanStep(state) {
   state.mode = "scan_complete";
   state.phase = "ready";
   state.completedAt = new Date().toISOString();
+  {
+    // 扫描阶段结束时刻：界面据此分开显示扫描用时与下载用时。
+    const scanningJob = activeJob(state);
+    if (scanningJob && !scanningJob.scanCompletedAt) {
+      scanningJob.scanCompletedAt = state.completedAt;
+      const vias = new Set((state.directoryScans || []).map((record) => record.via === "api" ? "api" : "page"));
+      scanningJob.scanVia = vias.has("api") && vias.has("page") ? "mixed" : vias.has("api") ? "api" : vias.has("page") ? "page" : "";
+    }
+  }
   transitionPersistentWorkflow(
     state,
     state.scanFailures.length || state.workflow.counts.unverifiedDirectories > 0
@@ -2967,8 +3377,20 @@ async function processScanStep(state) {
   }
 }
 
+function itemRetryDelay(item, now = Date.now()) {
+  return Math.max(0, (Number(item?.retryNotBefore) || 0) - now);
+}
+
+// 退避中的文件排在可立即处理的文件之后；全部退避时返回最早到期的一个。
 function selectedPendingItem(state) {
-  return state.items.find((item) => item.selected && item.status === "pending");
+  const now = Date.now();
+  let deferred = null;
+  for (const item of state.items) {
+    if (!item.selected || item.status !== "pending") continue;
+    if (!itemRetryDelay(item, now)) return item;
+    if (!deferred || item.retryNotBefore < deferred.retryNotBefore) deferred = item;
+  }
+  return deferred || undefined;
 }
 
 function removeActiveTransfer(state, itemId) {
@@ -2983,6 +3405,7 @@ function markAttemptFailure(state, item, stage, error, retryTaskId = null) {
   const detail = String(error || stage);
   item.failureStage = stage;
   item.error = detail;
+  item.failureReason = runtimeDownloadRecovery.classifyRecoveryError(error);
   item.history = [...(item.history || []), {
     at: new Date().toISOString(),
     attempt: item.attempts,
@@ -3002,6 +3425,9 @@ function markAttemptFailure(state, item, stage, error, retryTaskId = null) {
   } else if (error?.code !== "POPO_PERMISSION_DENIED" && item.attempts <= state.settings.maxRetries) {
     item.status = "pending";
     item.stage = `等待重试（${item.attempts}/${state.settings.maxRetries + 1}）`;
+    item.retryNotBefore = Date.now() + PREPARE_RETRY_BACKOFF_MS[
+      Math.min(PREPARE_RETRY_BACKOFF_MS.length, Math.max(1, item.attempts)) - 1
+    ];
     pushLog(state, "warn", `${item.name}：${stage}，将重新加载父目录后重试`, detail);
   } else {
     item.status = "failed";
@@ -3018,7 +3444,8 @@ function markAttemptFailure(state, item, stage, error, retryTaskId = null) {
       attempt: Number(item.attempts) || 0,
       retrying: item.status === "pending",
       terminal: item.status === "failed",
-      reason: error?.code === "POPO_PERMISSION_DENIED" ? "permission_denied" : "operation_failed",
+      reason: runtimeDownloadRecovery.classifyRecoveryError(error),
+      routeDepth: (item.directoryRoute || []).length,
       httpStatus: Number(error?.httpStatus) || 0,
       businessCode: Number(error?.businessCode) || 0,
       recoveryCount: Number(state.workerRecoveryCount) || 0,
@@ -3402,6 +3829,7 @@ async function beginDownload(state, item, url) {
   freshItem.status = fresh.mode === "paused" ? "paused" : "transferring";
   freshItem.stage = fresh.mode === "paused" ? "已暂停" : "Gopeed 传输中";
   freshItem.transferDeadline = Date.now() + fresh.settings.timeouts.transfer;
+  fresh.prepareFailureStreak = 0;
   transitionPersistentWorkflow(fresh, "HANDOFF_ACCEPT", {
     reservedItemId: "",
     nextAction: "scan"
@@ -3472,7 +3900,9 @@ async function ensureTeamSpaceId(state) {
   return teamSpaceId;
 }
 
-async function requestDirectDownloadUrl(state, pageId) {
+// observed：接口没有返回地址时，是否借用页面里按文件名观察到的地址。
+// 只有在页面刚打开过该文件预览时才可信；按文件 ID 直接取址时没有打开过预览，必须关闭。
+async function requestDirectDownloadUrl(state, pageId, { observed = true } = {}) {
   const teamSpaceId = await ensureTeamSpaceId(state);
   let lastResponse = null;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
@@ -3501,12 +3931,16 @@ async function requestDirectDownloadUrl(state, pageId) {
     }
     const directUrl = lastResponse?.ok ? findFirstHttpUrl(lastResponse.body) : "";
     if (directUrl) return directUrl;
-    const observed = await sendToWork(state, {
+    if (!observed) {
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 400));
+      continue;
+    }
+    const observedResult = await sendToWork(state, {
       type: "GET_OBSERVED_DOWNLOAD_URL",
       pageId,
       filename: state.items.find((item) => item.id === state.preparingItemId)?.name || ""
     }, 5000, "读取页面已取得的文件地址");
-    const observedUrl = validateDownloadUrl(observed?.url);
+    const observedUrl = validateDownloadUrl(observedResult?.url);
     if (observedUrl) {
       pushRuntimeEvent(
         state,
@@ -3941,6 +4375,98 @@ async function reconcileUnownedPausedState(state) {
   return true;
 }
 
+// 页面流程：加载父目录、点开文件、等预览，取得下载地址。接口取址不可用时的回退路径。
+async function resolveDownloadUrlViaPage(state, item) {
+  item.stage = "加载父目录";
+  state.phase = "directory_loading";
+  pushLog(state, "info", `准备下载：${item.name}（第 ${item.attempts} 次）`);
+  await saveState(state);
+  await notifySource(state, {
+    type: "FOLDER_TASK_STATUS",
+    message: `正在准备 ${state.items.filter((entry) => entry.status === "success").length + 1} / ${state.items.filter((entry) => entry.selected).length}：${item.name}`
+  });
+  // 同一目录的相邻文件：从上一个文件的预览页直接返回目录，省去重新加载。
+  const reuseKey = directoryRouteKey(item);
+  const previousKey = state.workerAtDirectoryKey;
+  state.workerAtDirectoryKey = null;
+  let reusedDirectory = false;
+  // 返回键走整个标签页的历史：用户在原页面里切换过目录就不能再用，否则会把用户的页面一并退回去。
+  const sourceUrlNow = (await getTab(state.sourceTabId))?.url || "";
+  if (state.triggerMode === "folder_button" && previousKey === reuseKey &&
+      sourceUrlNow === (state.workerAtDirectorySourceUrl || "")) {
+    try {
+      reusedDirectory = await returnToDirectory(
+        state, item, Math.min(state.settings.timeouts.directoryLoad, RETURN_TO_DIRECTORY_MAX_MS)
+      );
+    } catch (error) {
+      if (isWorkerUnavailableError(error)) throw error;
+    }
+    if (!reusedDirectory) pushLog(state, "warn", `目录复用未确认，改为重新加载：${item.name}`);
+  }
+  if (reusedDirectory) {
+    // 已在目录里，无需再加载。
+  } else if (item.rootUrl || Array.isArray(item.directoryRoute)) {
+    await openDirectory(state, {
+      rootUrl: item.rootUrl || state.rootUrl || item.parentUrl,
+      route: item.directoryRoute || [],
+      url: item.parentUrl,
+      direct: item.directoryDirect
+    }, state.settings.timeouts.fileOpen);
+  } else {
+    await loadWorkUrl(state, item.parentUrl, state.settings.timeouts.directoryLoad, true);
+  }
+  await sendToWork(state, { type: "CLEAN_STATE" }, 5000, "清理上一次页面状态");
+
+  item.stage = "定位文件";
+  state.phase = "file_lookup";
+  await saveState(state);
+  const beforeUrl = await getWorkUrl(state);
+  const openResult = await sendToWork(state, {
+    type: "OPEN_ITEM",
+    name: item.name,
+    itemIndex: item.itemIndex,
+    expectedType: "file",
+    timeoutMs: state.settings.timeouts.itemLookup
+  }, state.settings.timeouts.itemLookup + 3000, "定位文件");
+  if (!openResult.clicked) {
+    const diagnosticItems = (openResult.diagnostics?.seenItems || [])
+      .map((entry) => `${entry.itemIndex}:${entry.name}`)
+      .slice(-20)
+      .join(" | ");
+    const detail = diagnosticItems ? `；已检查：${diagnosticItems}` : "";
+    throw Object.assign(new Error(
+      (openResult.reason === "not_found" ? "父目录中未找到该文件" : "文件行在点击前失效") + detail
+    ), {
+      failureStage: openResult.reason === "not_found" ? FAILURE.FILE_NOT_FOUND : FAILURE.FILE_OPEN_FAILED
+    });
+  }
+
+  item.stage = "打开文件";
+  state.phase = "file_opening";
+  await saveState(state);
+  await waitForWorkUrlChange(state, beforeUrl, state.settings.timeouts.fileOpen);
+
+  item.stage = "等待预览";
+  state.phase = "preview_loading";
+  await saveState(state);
+  const preview = await waitForPreview(state, item);
+  // 页面现在停在该目录下某文件的预览页；下一个同目录文件可从这里返回。
+  state.workerAtDirectoryKey = reuseKey;
+  state.workerAtDirectorySourceUrl = (await getTab(state.sourceTabId))?.url || "";
+
+  let directUrl = preview.mediaUrl;
+  if (!directUrl && preview.pageId) {
+    directUrl = await requestDirectDownloadUrl(state, preview.pageId);
+  }
+  return directUrl;
+}
+
+// 条目带文件 ID、接口扫描开启且没有回退过时，直接按 ID 取址。
+function apiDownloadEligible(state, item) {
+  return Boolean(item.pageId) && !item.apiFallback && state.settings?.useApiScan !== false &&
+    state.triggerMode === "folder_button";
+}
+
 async function processDownloadStep(state, { duringScan = false, skipTransferSync = false } = {}) {
   state.activeTransfers = Array.isArray(state.activeTransfers) ? state.activeTransfers : [];
   if (!skipTransferSync) await syncGopeedTransfers(state);
@@ -4086,6 +4612,21 @@ async function processDownloadStep(state, { duringScan = false, skipTransferSync
     return;
   }
 
+  const retryDelay = Math.max(
+    itemRetryDelay(item),
+    Math.max(0, (Number(state.prepareCooldownUntil) || 0) - Date.now())
+  );
+  if (retryDelay) {
+    if (duringScan) {
+      updatePersistentWorkflow(state, { nextAction: "scan" });
+      await processScanStep(state);
+    } else {
+      await saveState(state);
+      schedulePump(Math.min(1000, retryDelay));
+    }
+    return;
+  }
+
   const downloadHistory = await ensureSuccessfulDownloadRecords(state);
   if (!downloadHistory.ready) {
     state.phase = "checking_download_history";
@@ -4205,6 +4746,7 @@ async function processDownloadStep(state, { duringScan = false, skipTransferSync
   state.preparingItemId = item.id;
   state.activeItemId = item.id;
   item.attempts += 1;
+  delete item.retryNotBefore;
   item.status = "preparing";
   item.startedAt ||= new Date().toISOString();
   item.failureStage = "";
@@ -4216,64 +4758,23 @@ async function processDownloadStep(state, { duringScan = false, skipTransferSync
   transitionPersistentWorkflow(state, "HANDOFF_PREPARE");
 
   try {
-    item.stage = "加载父目录";
-    state.phase = "directory_loading";
-    pushLog(state, "info", `准备下载：${item.name}（第 ${item.attempts} 次）`);
-    await saveState(state);
-    await notifySource(state, {
-      type: "FOLDER_TASK_STATUS",
-      message: `正在准备 ${state.items.filter((entry) => entry.status === "success").length + 1} / ${state.items.filter((entry) => entry.selected).length}：${item.name}`
-    });
-    if (item.rootUrl || Array.isArray(item.directoryRoute)) {
-      await navigateDirectoryRoute(
-        state,
-        item.rootUrl || state.rootUrl || item.parentUrl,
-        item.directoryRoute || [],
-        state.settings.timeouts.fileOpen
-      );
-    } else {
-      await loadWorkUrl(state, item.parentUrl, state.settings.timeouts.directoryLoad, true);
+    let directUrl = "";
+    if (apiDownloadEligible(state, item)) {
+      item.stage = "按文件标识取址";
+      state.phase = "requesting_download_url";
+      pushLog(state, "info", `准备下载：${item.name}（第 ${item.attempts} 次，按文件标识）`);
+      await saveState(state);
+      try {
+        directUrl = await requestDirectDownloadUrl(state, item.pageId, { observed: false });
+      } catch (error) {
+        if (isWorkerUnavailableError(error)) throw error;
+        // 其余错误（含权限拒绝）改走页面流程并记住不再走接口：页面流程会先用预览里的媒体地址，
+        // 拿不到地址时才再次请求并按权限失败处理，不比原来更严格。
+        item.apiFallback = true;
+        recordApiScanFallback(state, error?.code === "POPO_PERMISSION_DENIED" ? "permission" : "download_url");
+      }
     }
-    await sendToWork(state, { type: "CLEAN_STATE" }, 5000, "清理上一次页面状态");
-
-    item.stage = "定位文件";
-    state.phase = "file_lookup";
-    await saveState(state);
-    const beforeUrl = await getWorkUrl(state);
-    const openResult = await sendToWork(state, {
-      type: "OPEN_ITEM",
-      name: item.name,
-      itemIndex: item.itemIndex,
-      expectedType: "file",
-      timeoutMs: state.settings.timeouts.itemLookup
-    }, state.settings.timeouts.itemLookup + 3000, "定位文件");
-    if (!openResult.clicked) {
-      const diagnosticItems = (openResult.diagnostics?.seenItems || [])
-        .map((entry) => `${entry.itemIndex}:${entry.name}`)
-        .slice(-20)
-        .join(" | ");
-      const detail = diagnosticItems ? `；已检查：${diagnosticItems}` : "";
-      throw Object.assign(new Error(
-        (openResult.reason === "not_found" ? "父目录中未找到该文件" : "文件行在点击前失效") + detail
-      ), {
-        failureStage: openResult.reason === "not_found" ? FAILURE.FILE_NOT_FOUND : FAILURE.FILE_OPEN_FAILED
-      });
-    }
-
-    item.stage = "打开文件";
-    state.phase = "file_opening";
-    await saveState(state);
-    await waitForWorkUrlChange(state, beforeUrl, state.settings.timeouts.fileOpen);
-
-    item.stage = "等待预览";
-    state.phase = "preview_loading";
-    await saveState(state);
-    const preview = await waitForPreview(state, item);
-
-    let directUrl = preview.mediaUrl;
-    if (!directUrl && preview.pageId) {
-      directUrl = await requestDirectDownloadUrl(state, preview.pageId);
-    }
+    if (!directUrl) directUrl = await resolveDownloadUrlViaPage(state, item);
 
     if (directUrl) {
       await beginDownload(state, item, directUrl);
@@ -4284,6 +4785,7 @@ async function processDownloadStep(state, { duringScan = false, skipTransferSync
       { failureStage: FAILURE.DOWNLOAD_NOT_ESTABLISHED }
     );
   } catch (error) {
+    state.workerAtDirectoryKey = null;
     if (isWorkerUnavailableError(error)) {
       item.status = "pending";
       item.stage = "页面刷新，等待自动接续";
@@ -4309,6 +4811,18 @@ async function processDownloadStep(state, { duringScan = false, skipTransferSync
           item.stage === "打开文件" ? FAILURE.FILE_OPEN_FAILED :
             item.stage === "等待预览" ? FAILURE.PREVIEW_LOAD_TIMEOUT :
               FAILURE.DOWNLOAD_NOT_ESTABLISHED);
+    const streak = runtimeDownloadRecovery.advancePrepareStreak(
+      Number(state.prepareFailureStreak) || 0,
+      error?.code === "POPO_PERMISSION_DENIED" ? "permission_denied" : "failure"
+    );
+    state.prepareFailureStreak = streak.streak;
+    if (streak.cooldown) {
+      // 连续失败多半是 POPO 短暂异常：冷却一会儿，并且这次失败不消耗该文件的重试次数。
+      state.prepareCooldownUntil = Date.now() + runtimeDownloadRecovery.PREPARE_COOLDOWN_MS;
+      item.attempts = Math.max(0, item.attempts - 1);
+      pushRuntimeEvent(state, "PREPARE_COOLDOWN", "warn",
+        "连续多个文件准备失败，暂停 30 秒后继续", "", { jobId: activeJob(state)?.id || "" });
+    }
     markAttemptFailure(state, item, failureStage, error);
     if (item.status === "pending") await reopenDownloadOperation(state, item);
     else await completeDownloadOperation(state, item, "failed");
@@ -4332,15 +4846,20 @@ async function processPersistentWorkflowStep(state) {
       pushLog(state, "warn", "Gopeed 暂未连接，继续查找文件", gopeedReadiness.connection?.error);
     }
   }
+  // 先扫完再下：扫描队列与定位队列清空前不交付新文件。
+  const scanFinished = state.scanQueue.length === 0 && state.resolveQueue.length === 0 &&
+    !(state.apiScanQueue || []).length;
   const action = typeof runtimeWorkflow?.choosePersistentWorkflowAction === "function"
     ? runtimeWorkflow.choosePersistentWorkflowAction({
       workflow: state.workflow,
       hasPending: Boolean(selectedPendingItem(state)),
       hasPreparing: Boolean(state.preparingItemId),
       activeTransfers: state.activeTransfers.length,
-      concurrency: state.settings.concurrency
+      concurrency: state.settings.concurrency,
+      scanFinished
     })
     : (Boolean(state.preparingItemId) || (
+      scanFinished &&
       state.workflow.nextAction === "handoff" &&
       state.activeTransfers.length < state.settings.concurrency &&
       selectedPendingItem(state)
@@ -5084,19 +5603,12 @@ function directoryIssueCount(job) {
   );
 }
 
-async function retryJob(jobId) {
-  const { state } = await getStored();
-  const source = (state.jobs || []).find((candidate) => candidate.id === jobId);
+// 由失败任务构造补下任务；没有可重试的文件或目录时返回 null。
+function buildRetryJob(state, source, { failure = null, auto = false } = {}) {
   const fileRetryKeys = failedFileRetryKeys(source);
   const missingDirectories = directoryIssueCount(source);
-  if (!fileRetryKeys.length && !missingDirectories) {
-    throw new Error("这个任务没有可重试的失败文件或遗漏目录");
-  }
-  const existing = (state.jobs || []).find(
-    (candidate) => candidate.retryOfJobId === source.id && !isJobTerminal(candidate.status)
-  );
-  if (existing) return state;
-  const job = {
+  if (!fileRetryKeys.length && !missingDirectories) return null;
+  return {
     id: createId("job"),
     key: source.key,
     sourceTabId: source.sourceTabId,
@@ -5104,12 +5616,19 @@ async function retryJob(jobId) {
     displayName: `${source.folderName}（重试未完成项）`,
     folderItemIndex: source.folderItemIndex,
     parentUrl: source.parentUrl,
+    scope: source.scope,
     ...(source.batchId ? {
       batchId: source.batchId,
       batchParentUrl: source.batchParentUrl || source.parentUrl,
       batchPaused: Boolean(source.batchPaused)
     } : {}),
     retryOfJobId: source.id,
+    autoRetryRound: auto ? (Number(source.autoRetryRound) || 0) + 1 : 0,
+    ...(failure ? {
+      retrySelection: structuredClone(failure),
+      retainedFailures: runtimeDownloadRecovery.remainingFailures(source.failureEntries || [], failure),
+      retainedCounts: runtimeDownloadRecovery.retainedRecoveryCounts(source.counts || {}, failure)
+    } : {}),
     retryKeys: missingDirectories ? [] : fileRetryKeys,
     status: "queued",
     cancelRequested: false,
@@ -5117,11 +5636,34 @@ async function retryJob(jobId) {
     startedAt: "",
     completedAt: "",
     counts: summarizeItems([], 0, 0),
-    lastMessage: missingDirectories
-      ? `等待重新扫描整个文件夹，补齐 ${missingDirectories} 个遗漏目录`
-      : `等待重新扫描并重试 ${fileRetryKeys.length} 个失败文件`
+    lastMessage: failure
+      ? `等待补下${failure.kind === "directory" ? "目录" : "文件"}：${failure.name}`
+      : auto
+        ? "失败项已自动补下一轮，等待重新扫描"
+        : missingDirectories
+          ? `等待重新扫描整个文件夹，补齐 ${missingDirectories} 个遗漏目录`
+          : `等待重新扫描并重试 ${fileRetryKeys.length} 个失败文件`
   };
+}
+
+async function retryJob(jobId, failureId = null) {
+  const { state } = await getStored();
+  const source = (state.jobs || []).find((candidate) => candidate.id === jobId);
+  if (!source || source.status !== "failed") throw new Error("这个任务已经不在失败列表，请刷新任务");
+  const selectedFailure = failureId == null ? null : source.failureEntries?.find((entry) => entry.id === failureId);
+  if (failureId != null && (!selectedFailure || !Array.isArray(selectedFailure.route) || !selectedFailure.url)) {
+    throw new Error("这个失败项缺少目录定位，请使用任务重试重新读取");
+  }
+  const job = buildRetryJob(state, source, { failure: selectedFailure });
+  if (!job) throw new Error("这个任务没有可重试的失败文件或遗漏目录");
+  const existing = (state.jobs || []).find(
+    (candidate) => candidate.retryOfJobId === source.id && !isJobTerminal(candidate.status)
+  );
+  if (existing) return state;
   state.jobs.push(job);
+  pushRuntimeEvent(state, "DOWNLOAD_ITEM_RETRY_REQUESTED", "info", "已加入失败项补下队列", "", {
+    jobId: job.id, itemId: failureId || "", reason: selectedFailure?.kind || "all_failed"
+  });
   if (!state.activeJobId) prepareJobForExecution(state, job, false);
   rotateRunToken(state);
   await saveState(state, true);
@@ -6224,6 +6766,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       case "REGISTER_WORKER_FRAME":
         return { ok: true, state: await registerWorkerFrame(sender, command.url) };
+      case "PAGE_PROBE_REPORT": {
+        const probe = {
+          at: new Date().toISOString(),
+          report: globalThis.PopoRuntime.pageProbe.sanitizeProbeReport(command.report)
+        };
+        await chrome.storage.local.set({ [PAGE_PROBE_KEY]: probe });
+        return { ok: true };
+      }
+      case "GET_PAGE_PROBE": {
+        const stored = await chrome.storage.local.get(PAGE_PROBE_KEY);
+        return { ok: true, probe: stored[PAGE_PROBE_KEY] || null };
+      }
       case "CANCEL_FOLDER_TASK": {
         const state = await withControlMutation(() => cancelTask());
         return { ok: true, state: publicState(state) };
@@ -6274,6 +6828,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       case "RETRY_JOB": {
         const state = await withControlMutation(() => retryJob(command.jobId));
+        return { ok: true, state: publicState(state) };
+      }
+      case "RETRY_JOB_ITEM": {
+        const state = await withControlMutation(() => retryJob(command.jobId, command.failureId));
         return { ok: true, state: publicState(state) };
       }
       case "DISMISS_JOB": {

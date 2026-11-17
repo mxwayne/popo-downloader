@@ -403,3 +403,71 @@ test("数量闭环凭证保留历史记录并只在两分钟内显示完整绿�
     warningSegment: false
   });
 });
+
+test("目录进度文案区分完成、读取失败与未核对", () => {
+  const { directoryProgressLabel } = uiModel;
+  const base = { path: ["官方素材", "劫妹"], expected: 77, found: 77, success: 77, failed: 0, active: 0, pending: 0 };
+  assert.match(directoryProgressLabel({ ...base, status: "verified" }), /完成 77\/77/);
+  assert.match(directoryProgressLabel({ ...base, success: 10, pending: 60, active: 7, status: "verified" }), /完成 10\/77/);
+  assert.match(directoryProgressLabel({ ...base, success: 0, status: "failed" }), /读取失败/);
+  assert.match(directoryProgressLabel({ ...base, expected: null, status: "unverified" }), /未核对/);
+});
+
+test("任务用时文案：扫描与下载分开计时，并标明扫描方式", () => {
+  const { jobTimingLabel, formatDuration } = uiModel;
+  assert.equal(formatDuration(8_000), "8 秒");
+  assert.equal(formatDuration(65_000), "1 分 5 秒");
+  assert.equal(formatDuration(3_725_000), "1 小时 2 分");
+  assert.equal(formatDuration(-5), "0 秒");
+  const t0 = Date.parse("2026-11-17T10:00:00Z");
+  const iso = (ms) => new Date(t0 + ms).toISOString();
+  const dirs = (via) => [{ path: ["A"], expected: 1, found: 1, success: 0, failed: 0, active: 0, pending: 0, status: "verified", via }];
+  assert.equal(jobTimingLabel({ status: "scanning", startedAt: iso(0) }, t0 + 8_000), "扫描已用 8 秒");
+  assert.equal(
+    jobTimingLabel({ status: "downloading", startedAt: iso(0), scanCompletedAt: iso(12_000), directories: dirs("api") }, t0 + 77_000),
+    "扫描用时 12 秒（接口） · 下载已用 1 分 5 秒"
+  );
+  assert.equal(
+    jobTimingLabel({ status: "complete", startedAt: iso(0), scanCompletedAt: iso(12_000), completedAt: iso(212_000), directories: dirs("page") }, t0 + 999_000),
+    "扫描用时 12 秒（页面） · 下载用时 3 分 20 秒"
+  );
+  assert.equal(
+    jobTimingLabel({ status: "complete", startedAt: iso(0), scanCompletedAt: iso(12_000), completedAt: iso(20_000), directories: [...dirs("api"), ...dirs("page")] }, t0),
+    "扫描用时 12 秒（接口+页面） · 下载用时 8 秒"
+  );
+  assert.equal(jobTimingLabel({ status: "complete", startedAt: iso(0), completedAt: iso(5_000) }, t0), "", "旧任务没有扫描完成时间时不显示");
+  assert.equal(jobTimingLabel({ status: "queued" }, t0), "");
+});
+
+test("完成提示带上扫描与下载用时并停留 10 秒；没有计时数据时保持原样", () => {
+  const timed = {
+    id: "job-timed", status: "complete", folderName: "马车鉴赏",
+    startedAt: "2026-11-17T10:00:00.000Z", scanCompletedAt: "2026-11-17T10:00:04.000Z",
+    completedAt: "2026-11-17T10:01:07.000Z", counts: { files: 32, success: 32, failed: 0, cancelled: 0 },
+    directories: [{ path: ["马车鉴赏"], expected: 2, found: 2, success: 2, failed: 0, active: 0, pending: 0, status: "verified", via: "api" }]
+  };
+  const notification = uiModel.notificationForTransition("downloading", timed);
+  assert.equal(notification.message, "已完成 32 个文件 · 扫描用时 4 秒（接口） · 下载用时 1 分 3 秒");
+  assert.equal(notification.timeoutMs, 10000);
+  const failed = uiModel.notificationForTransition("downloading", { ...timed, status: "failed" });
+  assert.match(failed.message, /下载用时 1 分 3 秒/);
+  assert.equal(failed.timeoutMs, null);
+});
+
+test("完成凭证生成完成提示：带扫描方式与用时，缺计时数据时只显示数量", () => {
+  const receipt = {
+    key: "k", parentUrl: "https://docs.popo.netease.com/team/pc/t/pageDetail/a", folderItemIndex: "1", folderName: "马车鉴赏",
+    completedAt: "2026-11-17T10:01:07.000Z", startedAt: "2026-11-17T10:00:00.000Z",
+    scanCompletedAt: "2026-11-17T10:00:04.000Z", scanVia: "api", counts: { files: 32, success: 32 }
+  };
+  const notification = uiModel.notificationForReceipt(receipt);
+  assert.deepEqual(notification, {
+    id: "k:receipt:2026-11-17T10:01:07.000Z", jobId: "k", kind: "success", title: "马车鉴赏",
+    message: "已完成 32 个文件 · 扫描用时 4 秒（接口） · 下载用时 1 分 3 秒", timeoutMs: 10000
+  });
+  const bare = uiModel.notificationForReceipt({ ...receipt, startedAt: undefined, scanCompletedAt: undefined, scanVia: undefined });
+  assert.equal(bare.message, "已完成 32 个文件");
+  assert.equal(bare.timeoutMs, 3000);
+  assert.equal(uiModel.jobTimingLabel({ id: "x", status: "complete", startedAt: receipt.startedAt, scanCompletedAt: receipt.scanCompletedAt, completedAt: receipt.completedAt, scanVia: "mixed" }),
+    "扫描用时 4 秒（接口+页面） · 下载用时 1 分 3 秒");
+});

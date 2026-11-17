@@ -30,10 +30,13 @@
     `#${PAGE_SCAN_FRAME_ID}`,
     `.${BUTTON_CLASS}`
   ].join(",");
+  // POPO 类型筛选按钮的文案随界面语言变化；它是项目数的挂载锚点。
+  const TYPE_FILTER_LABELS = new Set(["所有类型", "所有類型", "All types"]);
   const IS_TOP_FRAME = window.top === window;
   const IS_PAGE_SCAN_FRAME = !IS_TOP_FRAME &&
     window.name.startsWith(PAGE_SCAN_FRAME_NAME_PREFIX);
   const {
+    collectScannedRow,
     inferVirtualListItemCount,
     validateDownloadUrl,
     selectObservedDownloadUrl,
@@ -61,6 +64,43 @@
     if (observedDownloadUrls.length > MAX_OBSERVED_DOWNLOAD_URLS) {
       observedDownloadUrls.splice(0, observedDownloadUrls.length - MAX_OBSERVED_DOWNLOAD_URLS);
     }
+  }
+
+  // ── 页面结构诊断：目录扫描后上报接口字段名与行元素属性名，后台再清洗一次。
+  const PROBE_EVENT = "popo-stable-download:probe";
+  const REQUEST_PROBE_EVENT = "popo-stable-download:request-probe";
+  const PROBE_MIN_INTERVAL_MS = 60000;
+  let lastProbeAt = 0;
+  let probePayload = { apis: [], enums: { pageTypePairs: [] } };
+
+  window.addEventListener(PROBE_EVENT, (event) => {
+    try { probePayload = JSON.parse(String(event.detail || "{}")); } catch { /* 保留上一次结果 */ }
+  });
+
+  function collectRowProbe() {
+    const rows = Array.from(currentDirectoryScroller()?.querySelectorAll(SELECTORS.row) || []).slice(0, 3);
+    const attributeNames = new Set();
+    let hasPageDetailLink = false;
+    for (const row of rows) {
+      for (const element of [row, ...row.querySelectorAll("*")]) {
+        for (const name of element.getAttributeNames()) attributeNames.add(name);
+        if (element.tagName === "A" && /pageDetail/.test(element.getAttribute("href") || "")) hasPageDetailLink = true;
+      }
+    }
+    return { attributeNames: Array.from(attributeNames).slice(0, 200), hasPageDetailLink };
+  }
+
+  async function reportPageProbe() {
+    if (Date.now() - lastProbeAt < PROBE_MIN_INTERVAL_MS) return;
+    lastProbeAt = Date.now();
+    try {
+      window.dispatchEvent(new Event(REQUEST_PROBE_EVENT));
+      await delay(200);
+      await chrome.runtime.sendMessage({
+        type: "PAGE_PROBE_REPORT",
+        report: { apis: probePayload.apis || [], enums: probePayload.enums, rows: collectRowProbe() }
+      });
+    } catch {}
   }
 
   window.addEventListener("popo-stable-download:observed-url", (event) => {
@@ -569,7 +609,7 @@
 
   function projectCountPlacement() {
     const label = Array.from(document.querySelectorAll("span"))
-      .find((element) => normalizeText(element.textContent) === "所有类型");
+      .find((element) => TYPE_FILTER_LABELS.has(normalizeText(element.textContent)));
     const leftControl = label?.parentElement;
     const host = leftControl?.parentElement;
     if (!host || !leftControl || !host.contains(leftControl)) return null;
@@ -1192,7 +1232,7 @@
       const replacement = currentDirectoryScroller();
       if (replacement && (!scroller.isConnected || replacement !== scroller)) scroller = replacement;
       for (const { item } of renderedEntries(scroller)) {
-        items.set(`${item.type}\u0000${item.itemIndex}\u0000${item.name}`, item);
+        collectScannedRow(items, item);
       }
 
       const maxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
@@ -1216,7 +1256,7 @@
     moveScroller(scroller, Math.max(0, scroller.scrollHeight - scroller.clientHeight));
     await delay(350);
     for (const { item } of renderedEntries(scroller)) {
-      items.set(`${item.type}\u0000${item.itemIndex}\u0000${item.name}`, item);
+      collectScannedRow(items, item);
     }
     const expectedItemCountAtEnd = currentVirtualListItemCount();
     const expectedItemCount = Number.isInteger(expectedItemCountAtEnd)
@@ -1404,6 +1444,14 @@
     };
   }
 
+  // 从文件预览页回到刚才的目录列表，省去重新加载整个目录页。
+  async function returnToDirectory(timeoutMs) {
+    history.back();
+    await delay(150);
+    await waitForDirectory(Math.max(1000, Number(timeoutMs) || 0));
+    return { url: location.href, directoryName: currentDirectoryName() };
+  }
+
   async function prepareOpenItem(name, expectedType, itemIndex, timeoutMs) {
     const search = await findItem(name, expectedType, itemIndex, timeoutMs);
     const found = search.entry;
@@ -1455,7 +1503,7 @@
       }))
       .filter((entry) => /^https?:\/\//i.test(entry.src));
     const downloadButtons = Array.from(document.querySelectorAll(SELECTORS.downloadButton))
-      .filter((button) => normalizeText(button.textContent) === "下载");
+      .filter((button) => ["下载", "下載", "Download"].includes(normalizeText(button.textContent)));
     const loadingCount = document.querySelectorAll(
       '[class*="loading"], [class*="spin"], [class*="skeleton"]'
     ).length;
@@ -1480,7 +1528,7 @@
     };
   }
 
-  function requestPageApi(path, queryParams, timeoutMs) {
+  function requestPageApi(path, queryParams, timeoutMs, post = null) {
     return new Promise((resolve, reject) => {
       const requestId = crypto.randomUUID();
       const timeout = setTimeout(() => {
@@ -1499,7 +1547,8 @@
       window.postMessage({
         source: API_REQUEST_SOURCE,
         requestId,
-        path: `${path}?${query.toString()}`
+        path: post ? path : `${path}?${query.toString()}`,
+        ...(post ? { method: "POST", body: post } : {})
       }, location.origin);
     });
   }
@@ -1509,6 +1558,15 @@
       "/api/bs-team-space/web/v1/page/download",
       { teamSpaceId, pageId },
       timeoutMs
+    );
+  }
+
+  function listFolder(teamSpaceId, pageId, pageMajorVersion, timeoutMs) {
+    return requestPageApi(
+      "/api/bs-team-space/web/v1/page/folderSubList",
+      {},
+      timeoutMs,
+      { teamSpaceId, pageId, ...(Number.isInteger(pageMajorVersion) ? { pageMajorVersion } : {}) }
     );
   }
 
@@ -1534,15 +1592,17 @@
           const context = currentDirectoryContext();
           return { ok: true, url: context.url, result: context };
         }
-        case "SCAN_DIRECTORY":
-          return {
-            ok: true,
-            result: await (message.hiddenFrame && IS_TOP_FRAME
-              ? scanDirectoryInHiddenFrame(message.timeoutMs)
-              : message.preserveScroll
-                ? scanDirectoryPreservingScroll(message.timeoutMs)
-                : scanDirectory(message.timeoutMs))
-          };
+        case "SCAN_DIRECTORY": {
+          const scanResult = await (message.hiddenFrame && IS_TOP_FRAME
+            ? scanDirectoryInHiddenFrame(message.timeoutMs)
+            : message.preserveScroll
+              ? scanDirectoryPreservingScroll(message.timeoutMs)
+              : scanDirectory(message.timeoutMs));
+          void reportPageProbe();
+          return { ok: true, result: scanResult };
+        }
+        case "RETURN_TO_DIRECTORY":
+          return { ok: true, result: await returnToDirectory(message.timeoutMs) };
         case "OPEN_ITEM":
           return {
             ok: true,
@@ -1559,6 +1619,11 @@
           return {
             ok: true,
             result: await requestDirectDownload(message.teamSpaceId, message.pageId, message.timeoutMs)
+          };
+        case "LIST_FOLDER":
+          return {
+            ok: true,
+            result: await listFolder(message.teamSpaceId, message.pageId, message.pageMajorVersion, message.timeoutMs)
           };
         case "GET_OBSERVED_DOWNLOAD_URL":
           return {
