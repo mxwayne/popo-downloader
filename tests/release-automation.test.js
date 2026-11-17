@@ -399,6 +399,8 @@ test("release also signs and publishes a GitHub backup manifest; only the COS ma
   // workflow: the backup manifest is a required Release asset, but only latest.json is published to COS
   assert.ok((workflow.match(/latest\.github\.json/g) || []).length >= 3);
   assert.doesNotMatch(workflow, /publish-cos-object\.py[^\n]*latest\.github\.json/);
+  // the live-channel check downloads latest.json to a temp dir, so the backup manifest path must be explicit there
+  assert.match(workflow, /-ManifestPath \$onlineManifest[^\n]*-GitHubManifestPath release-source\/dist\/latest\.github\.json/);
   // client: fixed repository, redirects followed by hand and only to approved GitHub hosts
   assert.match(host, /GitHubUpdateManifestUrl\s*=\s*\r?\n?\s*"https:\/\/github\.com\/mxwayne\/popo-downloader\/releases\/latest\/download\/latest\.github\.json"/);
   assert.match(host, /GetWithValidatedRedirects/);
