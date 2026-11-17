@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -49,6 +50,7 @@ internal static class FolderPickerHost
 #if POPO_NATIVEHOST_TEST
         if (HasArgument(args, "--test-validate-manifest")) return RunTestValidateManifest(args);
         if (HasArgument(args, "--test-check-url")) return RunTestCheckUrl(args);
+        if (HasArgument(args, "--test-foreign-gopeed")) return RunTestForeignGopeed(args);
 #endif
         try
         {
@@ -170,6 +172,18 @@ internal static class FolderPickerHost
     }
 
 #if POPO_NATIVEHOST_TEST
+    // 测试入口：判断是否有别人的 Gopeed 窗口（argv: --test-foreign-gopeed <内置 gopeed.exe 路径> <结果文件>）。
+    private static int RunTestForeignGopeed(string[] args)
+    {
+        int index = Array.IndexOf(args, "--test-foreign-gopeed");
+        string foreignPath;
+        string result = TryFindForeignGopeedWindow(Path.GetFullPath(args[index + 1]), out foreignPath)
+            ? "FOREIGN:" + foreignPath
+            : "NONE";
+        File.WriteAllText(args[index + 2], result, new UTF8Encoding(false));
+        return 0;
+    }
+
     // 测试入口：校验一份清单文件（argv: --test-validate-manifest <json> <cos|github> <结果文件>）。
     private static int RunTestValidateManifest(string[] args)
     {
@@ -998,6 +1012,20 @@ internal static class FolderPickerHost
         int startedProcessId = 0;
         if (FindBundledGopeedProcess(gopeedPath) == 0)
         {
+            // Gopeed 的 Windows 入口是“按窗口标题的全局单实例”：再启动一个 gopeed.exe，
+            // 它不会启动自己，而是把已有的 gopeed 窗口（哪怕在托盘里隐藏）显示并抢到前台，然后退出。
+            // 所以别人的 Gopeed 在运行时绝不能再启动，否则每次点扩展都会弹窗并抢焦点。
+            string foreignPath;
+            if (TryFindForeignGopeedWindow(gopeedPath, out foreignPath))
+            {
+                return new {
+                    ok = false,
+                    foreignGopeed = true,
+                    error = "另一个 Gopeed 正在运行并占用了 Gopeed 窗口"
+                        + (foreignPath.Length > 0 ? "（" + foreignPath + "）" : "")
+                        + "。POPO 不会强行把它调到前台；请在托盘里退出它后重试。"
+                };
+            }
             WriteGopeedTokenBridge(gopeedPath, apiToken);
             ProcessStartInfo startInfo = new ProcessStartInfo {
                 FileName = gopeedPath,
@@ -1332,6 +1360,70 @@ internal static class FolderPickerHost
             }
         }
         return false;
+    }
+
+    // ====== Gopeed 窗口占用检测：与 Gopeed 入口（windows/runner/main.cpp）使用同一个类名与标题 ======
+    private const string GopeedWindowClass = "FLUTTER_RUNNER_WIN32_WINDOW";
+    private const string GopeedWindowTitle = "gopeed";
+    private const uint ProcessQueryLimitedInformation = 0x1000;
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr FindWindow(string className, string windowName);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint access, bool inheritHandle, uint processId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool QueryFullProcessImageName(IntPtr process, int flags, StringBuilder path, ref int size);
+
+    // 已有 gopeed 窗口、且它不属于 expectedPath 指向的内置 Gopeed 时返回 true（foreignPath 为空表示读不到路径）。
+    private static bool TryFindForeignGopeedWindow(string expectedPath, out string foreignPath)
+    {
+        foreignPath = "";
+        string title = GopeedWindowTitle;
+#if POPO_NATIVEHOST_TEST
+        string overrideTitle = Environment.GetEnvironmentVariable("POPO_NATIVEHOST_TEST_GOPEED_TITLE");
+        if (!String.IsNullOrEmpty(overrideTitle)) title = overrideTitle;
+#endif
+        IntPtr window = FindWindow(GopeedWindowClass, title);
+        if (window == IntPtr.Zero) return false;
+        uint ownerId;
+        GetWindowThreadProcessId(window, out ownerId);
+        string ownerPath = ownerId == 0 ? "" : ReadProcessImagePath(ownerId);
+        if (ownerPath.Length > 0 &&
+            String.Equals(ownerPath, expectedPath, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+        foreignPath = ownerPath;
+        return true;
+    }
+
+    private static string ReadProcessImagePath(uint processId)
+    {
+        IntPtr handle = OpenProcess(ProcessQueryLimitedInformation, false, processId);
+        if (handle == IntPtr.Zero) return "";
+        try
+        {
+            StringBuilder buffer = new StringBuilder(1024);
+            int size = buffer.Capacity;
+            if (!QueryFullProcessImageName(handle, 0, buffer, ref size)) return "";
+            return Path.GetFullPath(buffer.ToString());
+        }
+        catch
+        {
+            return "";
+        }
+        finally
+        {
+            CloseHandle(handle);
+        }
     }
 
     private static int FindBundledGopeedProcess(string expectedPath)

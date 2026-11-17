@@ -1,20 +1,35 @@
 name: Set up pinned Gopeed build toolchain
-description: Install the exact Go, Flutter, and LLVM-MinGW versions used to build bundled Gopeed.
+description: >-
+  Install the exact Go, Flutter, and LLVM-MinGW versions used to build bundled Gopeed.
+  Only toolchains and dependency downloads are cached; the built gopeed.exe is never cached.
+inputs:
+  source-root:
+    description: Checked-out source directory that holds vendor/gopeed (its patch file keys the Go cache).
+    default: .
 runs:
   using: composite
   steps:
+    # Caches hold toolchains and dependency downloads only. Go modules are checked against go.sum,
+    # Flutter pub packages against pubspec.lock, and the LLVM-MinGW archive against a pinned SHA-256 below.
     - name: Set up Go
       uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
       with:
         go-version: 1.24.11
-        cache: false
+        cache: true
+        cache-dependency-path: ${{ inputs.source-root }}/vendor/gopeed/v1.9.3/popo-api-token-bootstrap.patch
 
     - name: Set up Flutter
       uses: subosito/flutter-action@395322a6cded4e9ed503aebd4cc1965625f8e59a # v2.20.0
       with:
         flutter-version: 3.41.2
         channel: stable
-        cache: false
+        cache: true
+
+    - name: Restore the pinned LLVM-MinGW archive
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ runner.temp }}/popo-gopeed-tooling/llvm-mingw-20260922-ucrt-x86_64.zip
+        key: llvm-mingw-20260922-ucrt-x86_64-sha256-e3ad77d1
 
     - name: Install pinned LLVM-MinGW
       shell: pwsh
@@ -30,9 +45,16 @@ runs:
         $llvmRoot = Join-Path $toolingRoot 'llvm-mingw'
 
         New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
-        Invoke-WebRequest -Uri $downloadUrl -OutFile $archivePath
-        $actualSha256 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ($actualSha256 -ne $expectedSha256) {
+        function Get-ArchiveSha256 { (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant() }
+        # A restored cache entry is untrusted until its SHA-256 matches; a mismatch falls back to a fresh download.
+        if ((Test-Path -LiteralPath $archivePath -PathType Leaf) -and (Get-ArchiveSha256) -ne $expectedSha256) {
+          Write-Output 'The cached LLVM-MinGW archive does not match the pinned SHA-256; downloading it again.'
+          Remove-Item -LiteralPath $archivePath -Force
+        }
+        if (-not (Test-Path -LiteralPath $archivePath -PathType Leaf)) {
+          Invoke-WebRequest -Uri $downloadUrl -OutFile $archivePath
+        }
+        if ((Get-ArchiveSha256) -ne $expectedSha256) {
           throw 'The pinned LLVM-MinGW archive SHA-256 does not match.'
         }
         Expand-Archive -LiteralPath $archivePath -DestinationPath $extractRoot

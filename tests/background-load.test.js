@@ -193,3 +193,77 @@ test("固定端口不可用时自动启动内置 Gopeed 并保存发现的端口
   delete global.PopoRuntime;
   delete require.cache[backgroundPath];
 });
+
+test("别的 Gopeed 占着窗口时：原样显示占用提示，不加“内置 Gopeed 启动失败”前缀", async () => {
+  const backgroundPath = require.resolve(path.join(__dirname, "..", "background.js"));
+  delete require.cache[backgroundPath];
+  const stored = {};
+  const requestedEndpoints = [];
+  const requestedTokens = [];
+  let nativeRequest = null;
+  const actualGopeed = require("../gopeed.js");
+
+  global.importScripts = (...files) => {
+    if (files.includes("runtime/popo-runtime.js")) global.PopoRuntime = require("../runtime/popo-runtime.cjs");
+    if (files.includes("core.js")) global.PopoCore = require("../core.js");
+    if (files.includes("gopeed.js")) {
+      global.PopoGopeed = {
+        ...actualGopeed,
+        async getConfig(settings) {
+          requestedEndpoints.push(settings.gopeedEndpoint);
+          requestedTokens.push(settings.gopeedToken);
+          if (settings.gopeedEndpoint === "http://127.0.0.1:32123") {
+            return { downloadDir: "D:\\Downloads", maxRunning: 5 };
+          }
+          throw new Error("connection refused");
+        }
+      };
+    }
+    if (files.includes("queue.js")) global.PopoQueue = require("../queue.js");
+  };
+  global.chrome = {
+    alarms: { create() {}, onAlarm: eventStub() },
+    runtime: {
+      onInstalled: eventStub(),
+      onMessage: eventStub(),
+      onStartup: eventStub(),
+      async sendNativeMessage(_host, request) {
+        nativeRequest = request;
+        return {
+          ok: false,
+          foreignGopeed: true,
+          error: "另一个 Gopeed 正在运行并占用了 Gopeed 窗口（D:\\Other\\gopeed.exe）。POPO 不会强行把它调到前台；请在托盘里退出它后重试。"
+        };
+      }
+    },
+    storage: {
+      local: {
+        async get(keys) {
+          return Object.fromEntries(keys.filter((key) => key in stored).map((key) => [key, stored[key]]));
+        },
+        async set(values) { Object.assign(stored, values); }
+      }
+    },
+    tabs: { onRemoved: eventStub(), onUpdated: eventStub() }
+  };
+  stored.popoSettings = {};
+
+  require(backgroundPath);
+  const listener = global.chrome.runtime.onMessage.listeners[0];
+  const response = await new Promise((resolve) => {
+    assert.equal(listener({ type: "CHECK_GOPEED" }, {}, resolve), true);
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(response.connection.connected, false);
+  assert.match(response.connection.error, /^另一个 Gopeed 正在运行并占用了 Gopeed 窗口/);
+  assert.doesNotMatch(response.connection.error, /内置 Gopeed 启动失败/);
+
+  delete global.chrome;
+  delete global.importScripts;
+  delete global.PopoCore;
+  delete global.PopoGopeed;
+  delete global.PopoQueue;
+  delete global.PopoRuntime;
+  delete require.cache[backgroundPath];
+});

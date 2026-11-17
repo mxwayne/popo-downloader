@@ -35,6 +35,8 @@ jobs:
 
       - name: Set up Gopeed build toolchain
         uses: ./.github/actions/setup-gopeed-toolchain
+        with:
+          source-root: .
 
       - name: Install dependencies
         shell: pwsh

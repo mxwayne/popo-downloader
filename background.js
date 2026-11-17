@@ -1597,6 +1597,7 @@ async function checkGopeedConnection(settings, stateToUpdate = null) {
       if (!nativeResult?.ok || !nativeResult.endpoint) {
         const nativeFailure = new Error(nativeResult?.error || "本机助手没有返回 Gopeed 地址");
         nativeFailure.popoMaintenance = Boolean(nativeResult?.maintenance);
+        nativeFailure.popoForeignGopeed = Boolean(nativeResult?.foreignGopeed);
         throw nativeFailure;
       }
       effectiveSettings = mergeSettings({
@@ -1608,7 +1609,8 @@ async function checkGopeedConnection(settings, stateToUpdate = null) {
       config = await getGopeedConfig(effectiveSettings, { timeoutMs: 5000 });
     } catch (nativeError) {
       const nativeDetail = String(nativeError?.message || nativeError).replace(/^Error:\s*/, "");
-      const detail = nativeError?.popoMaintenance
+      // 维护提示与“别的 Gopeed 占着窗口”本身就是完整说明，不再套“内置 Gopeed 启动失败”。
+      const detail = nativeError?.popoMaintenance || nativeError?.popoForeignGopeed
         ? nativeDetail
         : nativeDetail.includes("Gopeed API Token 不正确")
           ? "下载服务访问密钥不正确，请核对本机下载服务和扩展中的设置。"
