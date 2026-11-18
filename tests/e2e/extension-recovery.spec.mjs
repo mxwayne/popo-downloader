@@ -3,6 +3,7 @@ import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { isolateNativeHost } from "./native-host-isolation.mjs";
 
 const projectRoot = fileURLToPath(new URL("../..", import.meta.url));
 const extensionEntries = [
@@ -34,6 +35,7 @@ async function copyExtension() {
     await mkdir(dirname(destination), { recursive: true });
     await cp(source, destination, { recursive: true });
   }
+  await isolateNativeHost(extensionDir);
 }
 
 async function launchExtension() {
@@ -413,6 +415,16 @@ test("自动更新失败时弹窗显示原因、退出 Gopeed 的指引和 GitHu
   );
   await expect(notice).toContainText("自动更新失败");
   await popup.screenshot({ path: resolve(projectRoot, "output/update-failure-notice.png"), fullPage: true });
+});
+
+test("沙箱扩展连不上本机真实安装的原生助手（不会在真实 Stable/Dev 目录里启动 Gopeed）", async () => {
+  // 扩展 ID 与 Stable 相同，没有隔离时这里会连上真实助手并启动真实的 Gopeed。
+  const { extensionId } = await launchExtension();
+  const popup = await openPopup(extensionId);
+  const response = await popup.evaluate(() => chrome.runtime.sendMessage({ type: "CHECK_GOPEED" }));
+  expect(response.ok).toBe(true);
+  expect(response.connection.connected).toBe(false);
+  expect(response.connection.error).toMatch(/native messaging host not found/i);
 });
 
 test("接口桥只放行 folderSubList 的模板请求体，其余路径、方法、字段被拒绝", async () => {

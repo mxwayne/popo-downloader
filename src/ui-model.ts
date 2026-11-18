@@ -902,7 +902,7 @@ export function updateFailureGuidance(
   if (/setup process|exit code|installer/i.test(detail)) {
     return {
       title: "自动更新失败：安装程序没有完成",
-      hint: "最常见的原因是 Gopeed 仍在运行并占用文件。请先退出 Gopeed（右下角托盘图标里也要退出），再重新打开本弹窗重试。",
+      hint: "最常见的原因是 Gopeed 仍在运行并占用文件。请先退出 Gopeed（右下角托盘图标里也要退出），再重新打开本弹窗重试。如果退出后仍然失败，可能有以管理员身份运行的 Gopeed：请用管理员身份打开任务管理器结束 gopeed.exe，或重启电脑后再试。",
       detail,
     };
   }

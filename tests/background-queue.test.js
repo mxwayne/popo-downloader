@@ -595,6 +595,103 @@ test("successful automatic installation persists its handoff before reloading ex
   }
 });
 
+// 2026-11-17 现场：安装器失败后“更新交接”记录一直保持进行中，之后每次检查都只重读旧的失败记录，再也不发起新的更新。
+const failedInstallHarnessOptions = (counters) => ({
+  runtimeManifest: { version: "0.8.1", version_name: "0.8.1" },
+  updatePollDelayMs: 0,
+  async sendNativeMessage(_host, message) {
+    if (message.action === "agent_connection") throw new Error("shadow agent unavailable");
+    if (message.action === "check_update") {
+      return { ok: true, available: true, installedVersion: "0.8.1", runtimeMatchesInstalled: true, version: "0.8.2" };
+    }
+    if (message.action === "apply_update") { counters.applied += 1; return { ok: true, started: true }; }
+    if (message.action === "update_status") {
+      return {
+        ok: true, state: "failed", currentVersion: "0.8.1", targetVersion: "0.8.2",
+        message: "The verified setup process failed with exit code 1.",
+        updatedAt: "2026-11-17T20:50:29.9382142+08:00"
+      };
+    }
+    throw new Error("unexpected native action " + message.action);
+  }
+});
+const idleQueueState = {
+  version: 4, jobs: [], activeJobId: null, activeTransfers: [], mode: "idle", phase: "idle", settings: {}
+};
+
+test("a failed installation releases the update handoff so the next check starts a new attempt", async () => {
+  const counters = { applied: 0 };
+  const harness = createHarness(
+    { popoSettings: {}, popoState: idleQueueState },
+    failedInstallHarnessOptions(counters)
+  );
+  try {
+    harness.fireAlarm("popo-stable-downloader-update");
+    await waitUntil(() => harness.stored.popoUpdateStatus?.state === "failed");
+    assert.equal(counters.applied, 1);
+    assert.ok(!harness.stored.popoUpdateReloadState?.targetVersion, "the handoff must not stay pending after a failed install");
+    harness.fireAlarm("popo-stable-downloader-update");
+    await waitUntil(() => counters.applied === 2);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("an already stuck handoff from a failed installation is released and retried", async () => {
+  const counters = { applied: 0 };
+  const harness = createHarness(
+    {
+      popoSettings: {},
+      popoState: idleQueueState,
+      popoUpdateStatus: {
+        state: "failed", currentVersion: "0.8.1", targetVersion: "0.8.2",
+        message: "The verified setup process failed with exit code 1.", updatedAt: "2026-11-17T20:50:29.9382142+08:00"
+      },
+      popoUpdateReloadState: { targetVersion: "0.8.2", reloadRequired: false, reloadAttemptCount: 0, lastReloadRequestedAt: "" }
+    },
+    failedInstallHarnessOptions(counters)
+  );
+  try {
+    harness.fireAlarm("popo-stable-downloader-update");
+    await waitUntil(() => counters.applied === 1);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("a stuck handoff is released once a manual install brought the runtime to or past its target", async () => {
+  for (const runtimeVersion of ["0.8.2", "0.8.3"]) {
+    const counters = { applied: 0, checked: 0 };
+    const harness = createHarness(
+      {
+        popoSettings: {},
+        popoState: idleQueueState,
+        popoUpdateReloadState: { targetVersion: "0.8.2", reloadRequired: false, reloadAttemptCount: 0, lastReloadRequestedAt: "" }
+      },
+      {
+        runtimeManifest: { version: runtimeVersion, version_name: runtimeVersion },
+        async sendNativeMessage(_host, message) {
+          if (message.action === "agent_connection") throw new Error("shadow agent unavailable");
+          // 手动安装后主机的更新状态不是 failed，所以不能只靠“失败”来释放交接。
+          if (message.action === "update_status") return { ok: true, state: "idle", currentVersion: "", targetVersion: "", message: "" };
+          if (message.action === "check_update") {
+            counters.checked += 1;
+            return { ok: true, available: false, installedVersion: runtimeVersion, runtimeMatchesInstalled: true, version: runtimeVersion };
+          }
+          throw new Error("unexpected native action " + message.action);
+        }
+      }
+    );
+    try {
+      harness.fireAlarm("popo-stable-downloader-update");
+      await waitUntil(() => counters.checked === 1);
+      assert.ok(!harness.stored.popoUpdateReloadState?.targetVersion, "runtime " + runtimeVersion);
+    } finally {
+      harness.cleanup();
+    }
+  }
+});
+
 test("a new service worker recovers a succeeded install that the old worker did not observe", async () => {
   let updateStatusReads = 0;
   const harness = createHarness(

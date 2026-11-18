@@ -6051,10 +6051,11 @@ async function recoverAutomaticUpdateHandoff() {
         await requestControlledRuntimeReload(targetVersion, updateStatus);
         return;
       }
-      if (updateStatus.state === "failed" ||
-          !UPDATE_INSTALL_ACTIVE_STATES.has(updateStatus.state)) {
+      if (updateStatus.state === "failed") {
+        await saveUpdateReloadState({});
         return;
       }
+      if (!UPDATE_INSTALL_ACTIVE_STATES.has(updateStatus.state)) return;
       await new Promise((resolve) => setTimeout(resolve, 2000));
     }
   } finally {
@@ -6411,6 +6412,30 @@ function updateBlockedByActiveJobs(state) {
   return (state?.jobs || []).some((job) => !isJobTerminal(job.status));
 }
 
+// 安装器失败后，“更新交接”记录不能继续保持进行中：进行中的记录会让之后每次检查都只重读那条旧的失败，
+// 再也不发起新的更新（2026-11-17 现场）。主机上的更新状态是 failed 时释放它，并允许本次检查继续。
+async function releaseStaleUpdateHandoff(handoff, currentVersion) {
+  // 运行版本已经到达或超过交接目标，但安装器从没报告成功（例如用户手动运行了安装包）：这条交接已经过时。
+  const order = compareUpdateVersions(currentVersion, handoff.targetVersion);
+  if (!handoff.reloadRequired && order !== null && order >= 0) {
+    await saveUpdateReloadState({});
+    return true;
+  }
+  return releaseHandoffAfterFailedInstall();
+}
+
+async function releaseHandoffAfterFailedInstall() {
+  let status;
+  try {
+    status = await chrome.runtime.sendNativeMessage(FOLDER_PICKER_HOST, { action: "update_status" });
+  } catch {
+    return false;
+  }
+  if (!status?.ok || status.state !== "failed") return false;
+  await saveUpdateReloadState({});
+  return true;
+}
+
 async function runAutomaticUpdateCheck() {
   if (isDevelopmentBuild()) {
     await saveAutomaticUpdateStatus({
@@ -6422,7 +6447,8 @@ async function runAutomaticUpdateCheck() {
   }
   if (automaticUpdateLocked) return;
   const handoff = await readUpdateReloadState();
-  if (updateReloadHandoffPending(handoff)) {
+  if (updateReloadHandoffPending(handoff) &&
+      !(await releaseStaleUpdateHandoff(handoff, chrome.runtime.getManifest().version))) {
     void recoverAutomaticUpdateHandoff();
     return;
   }
@@ -6504,6 +6530,7 @@ async function runAutomaticUpdateCheck() {
         return;
       }
       if (updateStatus.state === "failed") {
+        await saveUpdateReloadState({});
         throw new Error(updateStatus.message || "自动更新失败，已保留当前版本");
       }
     }

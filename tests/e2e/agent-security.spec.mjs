@@ -5,6 +5,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { isolateNativeHost } from "./native-host-isolation.mjs";
 
 const projectRoot = fileURLToPath(new URL("../..", import.meta.url));
 const compiler = "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe";
@@ -32,6 +33,7 @@ async function copyExtension(extensionRoot) {
     await mkdir(dirname(destination), { recursive: true });
     await cp(resolve(projectRoot, entry), destination, { recursive: true });
   }
+  await isolateNativeHost(extensionRoot);
 }
 
 function compileAgent(output) {
