@@ -1592,7 +1592,8 @@ test("popup copies a bounded redacted update diagnostic snapshot", async () => {
         currentVersion: "0.7.2",
         targetVersion: "D:\\private\\legacy-e2e-version.txt",
         message: "e2e legacy secret message",
-        updatedAt: "2026-08-14T01:00:00.000Z"
+        // 用刚刚的时间：过期的状态会让弹窗顺便检查一次更新，改写这里要断言的诊断历史。
+        updatedAt: new Date().toISOString()
       },
       popoAgentShadowStatus: {
         available: true,

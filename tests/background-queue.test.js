@@ -204,9 +204,13 @@ function createHarness(initial = {}, options = {}) {
   const fireAlarm = (name) => {
     for (const alarmListener of global.chrome.alarms.onAlarm.listeners) alarmListener({ name });
   };
+  const fireStartup = () => {
+    for (const startupListener of global.chrome.runtime.onStartup.listeners) startupListener();
+  };
   return {
     actionState,
     cleanup,
+    fireStartup,
     continuedGopeedTasks,
     deletedGopeedTasks,
     fireAlarm,
@@ -689,6 +693,88 @@ test("a stuck handoff is released once a manual install brought the runtime to o
     } finally {
       harness.cleanup();
     }
+  }
+});
+
+// 发新版后用户要尽快更新：弹窗打开、扩展启动/重载时，上一次检查已过期就立刻检查，不再干等 5 分钟或 6 小时的闹钟。
+const minutesAgo = (minutes) => new Date(Date.now() - minutes * 60_000).toISOString();
+const staleCheckHarness = (status, counters) => createHarness(
+  { popoSettings: {}, popoState: idleQueueState, ...(status ? { popoUpdateStatus: status } : {}) },
+  {
+    runtimeManifest: { version: "0.8.2", version_name: "0.8.2" },
+    async sendNativeMessage(_host, message) {
+      if (message.action === "agent_connection") throw new Error("shadow agent unavailable");
+      if (message.action === "check_update") {
+        counters.checked += 1;
+        return { ok: true, available: false, installedVersion: "0.8.2", runtimeMatchesInstalled: true, version: "0.8.2" };
+      }
+      throw new Error("unexpected native action " + message.action);
+    }
+  }
+);
+const upToDate = (minutes) => ({
+  state: "up_to_date", currentVersion: "0.8.2", targetVersion: "0.8.2", message: "ok", updatedAt: minutesAgo(minutes)
+});
+
+test("opening the popup checks for updates when the last check is stale", async () => {
+  const counters = { checked: 0 };
+  const harness = staleCheckHarness(upToDate(120), counters);
+  try {
+    const response = await harness.send({ type: "GET_UPDATE_STATUS" });
+    assert.equal(response.ok, true);
+    await waitUntil(() => counters.checked === 1);
+    await waitUntil(() => Date.now() - Date.parse(harness.stored.popoUpdateStatus.updatedAt) < 60_000);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("opening the popup does not check again while the last check is recent", async () => {
+  const counters = { checked: 0 };
+  const harness = staleCheckHarness(upToDate(2), counters);
+  try {
+    await harness.send({ type: "GET_UPDATE_STATUS" });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(counters.checked, 0);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("repeated popup polls start only one stale check", async () => {
+  const counters = { checked: 0 };
+  const harness = staleCheckHarness(upToDate(120), counters);
+  try {
+    await Promise.all([1, 2, 3, 4].map(() => harness.send({ type: "GET_UPDATE_STATUS" })));
+    await waitUntil(() => counters.checked >= 1);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    await harness.send({ type: "GET_UPDATE_STATUS" });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(counters.checked, 1);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("a deferred update is rechecked when the popup is opened later", async () => {
+  const counters = { checked: 0 };
+  const harness = staleCheckHarness({ ...upToDate(60), state: "deferred" }, counters);
+  try {
+    await harness.send({ type: "GET_UPDATE_STATUS" });
+    await waitUntil(() => counters.checked === 1);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test("browser startup and extension reload check right away even without a previous check", async () => {
+  const counters = { checked: 0 };
+  const harness = staleCheckHarness(null, counters);
+  try {
+    harness.fireStartup();
+    await waitUntil(() => counters.checked === 1);
+  } finally {
+    harness.cleanup();
   }
 });
 

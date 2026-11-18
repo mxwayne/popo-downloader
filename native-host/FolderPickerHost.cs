@@ -51,6 +51,7 @@ internal static class FolderPickerHost
         if (HasArgument(args, "--test-validate-manifest")) return RunTestValidateManifest(args);
         if (HasArgument(args, "--test-check-url")) return RunTestCheckUrl(args);
         if (HasArgument(args, "--test-foreign-gopeed")) return RunTestForeignGopeed(args);
+        if (HasArgument(args, "--test-race")) return RunTestRace(args);
 #endif
         try
         {
@@ -172,6 +173,37 @@ internal static class FolderPickerHost
     }
 
 #if POPO_NATIVEHOST_TEST
+    // 测试入口：用可控延迟模拟两个更新来源（argv: --test-race <cos> <github> <结果文件>，规格 ok:毫秒 或 fail:毫秒）。
+    private static int RunTestRace(string[] args)
+    {
+        int index = Array.IndexOf(args, "--test-race");
+        Func<string, string, Func<UpdateManifest>> fake = delegate(string spec, string name)
+        {
+            return delegate
+            {
+                string[] parts = spec.Split(':');
+                Thread.Sleep(Int32.Parse(parts[1]));
+                if (parts[0] == "fail") throw new InvalidOperationException(name + "-error");
+                return new UpdateManifest { version = name };
+            };
+        };
+        System.Diagnostics.Stopwatch clock = System.Diagnostics.Stopwatch.StartNew();
+        string result;
+        try
+        {
+            UpdateManifest winner = RaceUpdateSources(
+                fake(args[index + 1], "cos"), fake(args[index + 2], "github"), GitHubHeadStartMs
+            );
+            result = "WIN:" + winner.version;
+        }
+        catch (Exception error)
+        {
+            result = "ERR:" + error.Message;
+        }
+        File.WriteAllText(args[index + 3], result + "|" + clock.ElapsedMilliseconds, new UTF8Encoding(false));
+        return 0;
+    }
+
     // 测试入口：判断是否有别人的 Gopeed 窗口（argv: --test-foreign-gopeed <内置 gopeed.exe 路径> <结果文件>）。
     private static int RunTestForeignGopeed(string[] args)
     {
@@ -389,10 +421,8 @@ internal static class FolderPickerHost
             {
                 // 清单来自腾讯云但安装包下载失败：同一版本的 GitHub 清单（同样经过签名校验）可以作为备用。
                 UpdateManifest fallback = null;
-                if (String.Equals(new Uri(manifest.url).Host, UpdateHost, StringComparison.OrdinalIgnoreCase))
-                {
-                    try { fallback = FetchUpdateManifest(UpdateSource.GitHub); } catch {}
-                }
+                bool manifestFromCos = String.Equals(new Uri(manifest.url).Host, UpdateHost, StringComparison.OrdinalIgnoreCase);
+                try { fallback = FetchUpdateManifest(manifestFromCos ? UpdateSource.GitHub : UpdateSource.Cos); } catch {}
                 if (fallback == null || !String.Equals(fallback.version, manifest.version, StringComparison.Ordinal))
                 {
                     throw downloadError;
@@ -400,7 +430,7 @@ internal static class FolderPickerHost
                 manifest = fallback;
                 try { if (File.Exists(archivePath)) File.Delete(archivePath); } catch {}
                 archivePath = Path.Combine(workRoot, manifest.artifact);
-                WriteUpdateStatus(productRoot, "downloading", currentVersion, manifest.version, "Downloading verified update package from the GitHub backup source.");
+                WriteUpdateStatus(productRoot, "downloading", currentVersion, manifest.version, "Downloading verified update package from the backup update source.");
                 DownloadUpdatePackage(manifest, archivePath);
                 VerifyDownloadedPackage(manifest, archivePath);
             }
@@ -456,25 +486,81 @@ internal static class FolderPickerHost
         }
     }
 
-    // 先读腾讯云清单；失败（网络、校验）时改读 GitHub 清单。GitHub 清单同样必须通过签名校验，
-    // 所以放宽来源不会削弱完整性保证。两个来源都失败时抛出腾讯云那次的错误，保持原有的错误分类。
+    // 腾讯云先走；它在 GitHubHeadStartMs 内没有结果，或者失败，GitHub 立刻加入；谁先拿到通过签名校验的清单就用谁。
+    // 这样直连能访问腾讯云的用户不受影响，需要代理才能访问 GitHub 的用户也不用等腾讯云超时。
+    // 两个来源都失败时抛出腾讯云那次的错误，保持原有的错误分类。
+    private const int GitHubHeadStartMs = 2500;
+    private const int ManifestRaceTimeoutMs = 30000;
+
     private static UpdateManifest ReadAndValidateUpdateManifest()
     {
-        try
-        {
-            return FetchUpdateManifest(UpdateSource.Cos);
-        }
-        catch (Exception cosError)
+        return RaceUpdateSources(
+            delegate { return FetchUpdateManifest(UpdateSource.Cos); },
+            delegate { return FetchUpdateManifest(UpdateSource.GitHub); },
+            GitHubHeadStartMs
+        );
+    }
+
+    private static UpdateManifest RaceUpdateSources(
+        Func<UpdateManifest> cos,
+        Func<UpdateManifest> github,
+        int headStartMs
+    )
+    {
+        object gate = new object();
+        UpdateManifest winner = null;
+        Exception cosError = null;
+        Exception githubError = null;
+        bool githubStarted = false;
+        int failures = 0;
+        ManualResetEvent done = new ManualResetEvent(false);
+        Action startGithub = null;
+        Action<Func<UpdateManifest>, bool> run = delegate(Func<UpdateManifest> fetch, bool isCos)
         {
             try
             {
-                return FetchUpdateManifest(UpdateSource.GitHub);
+                UpdateManifest manifest = fetch();
+                lock (gate) { if (winner == null) winner = manifest; }
+                done.Set();
             }
-            catch
+            catch (Exception error)
             {
-                throw cosError;
+                bool startOther = false;
+                lock (gate)
+                {
+                    if (isCos) cosError = error; else githubError = error;
+                    failures++;
+                    if (failures >= 2) done.Set();
+                    if (isCos && !githubStarted) startOther = true;
+                }
+                if (startOther) startGithub();
             }
+        };
+        startGithub = delegate
+        {
+            lock (gate)
+            {
+                if (githubStarted) return;
+                githubStarted = true;
+            }
+            Thread worker = new Thread(delegate() { run(github, false); });
+            worker.IsBackground = true;
+            worker.Start();
+        };
+
+        Thread cosWorker = new Thread(delegate() { run(cos, true); });
+        cosWorker.IsBackground = true;
+        cosWorker.Start();
+        if (!done.WaitOne(headStartMs)) startGithub();
+        done.WaitOne(ManifestRaceTimeoutMs);
+
+        lock (gate)
+        {
+            if (winner != null) return winner;
+            if (cosError != null) throw cosError;
+            if (githubError != null) throw githubError;
         }
+        throw new TimeoutException("The update sources did not answer in time.");
     }
 
     private static UpdateManifest FetchUpdateManifest(UpdateSource source)
@@ -682,7 +768,7 @@ internal static class FolderPickerHost
         HttpWebResponse response;
         if (fromGitHub)
         {
-            response = GetWithValidatedRedirects(manifest.url, 15000, 60000);
+            response = GetWithValidatedRedirects(manifest.url, 15000, 20000);
         }
         else
         {
@@ -691,7 +777,7 @@ internal static class FolderPickerHost
             request.AllowAutoRedirect = false;
             request.KeepAlive = false;
             request.Timeout = 15000;
-            request.ReadWriteTimeout = 60000;
+            request.ReadWriteTimeout = 20000;
             request.UserAgent = "POPOStableDownloader-Updater/1";
             response = (HttpWebResponse)request.GetResponse();
         }

@@ -110,6 +110,9 @@ const workerFrameWaiters = new Map();
 const popupUiPorts = new Set();
 const SERVICE_WORKER_STARTED_AT = new Date().toISOString();
 const UPDATE_CHECK_PERIOD_MINUTES = 6 * 60;
+// 上一次检查超过这个时间，弹窗打开或扩展启动时就再检查一次（发新版后不用干等闹钟）。
+const UPDATE_STALE_AFTER_MS = 10 * 60 * 1000;
+const UPDATE_STALE_CHECK_THROTTLE_MS = 60 * 1000;
 const FAILED_UPDATE_RETRY_THROTTLE_MS = 30 * 1000;
 const WORKER_RECOVERY_MAX_ATTEMPTS = 8;
 const WORKER_RECOVERY_MAX_MS = 5 * 60 * 1000;
@@ -6565,6 +6568,26 @@ async function retryFailedAutomaticUpdateOnStatusRead(status) {
   return checking;
 }
 
+// 触发点（弹窗打开、扩展启动或重载）调用：只有上一次检查已经过期才再查一次，并限频。
+// 失败状态有自己的立即重试；进行中的状态不打断。allowFirst 让刚安装、还没有任何记录的扩展也能立刻检查。
+let lastStaleUpdateCheckAt = 0;
+async function checkForUpdateIfStale({ allowFirst = false } = {}) {
+  if (isDevelopmentBuild() || automaticUpdateLocked) return;
+  const now = Date.now();
+  if (now - lastStaleUpdateCheckAt < UPDATE_STALE_CHECK_THROTTLE_MS) return;
+  const data = await chrome.storage.local.get("popoUpdateStatus");
+  const status = data.popoUpdateStatus;
+  if (!status) {
+    if (!allowFirst) return;
+  } else {
+    if (!["idle", "up_to_date", "deferred"].includes(String(status.state || "idle"))) return;
+    const checkedAt = Date.parse(String(status.updatedAt || ""));
+    if (Number.isFinite(checkedAt) && now - checkedAt < UPDATE_STALE_AFTER_MS) return;
+  }
+  lastStaleUpdateCheckAt = now;
+  void runAutomaticUpdateCheck();
+}
+
 function scheduleAutomaticUpdates(delayInMinutes) {
   if (isDevelopmentBuild()) {
     if (chrome.alarms.clear) void chrome.alarms.clear(UPDATE_ALARM);
@@ -6589,6 +6612,7 @@ chrome.runtime.onInstalled.addListener(async () => {
   chrome.alarms.create(DIAGNOSTIC_FLUSH_ALARM, { periodInMinutes: 1 });
   scheduleAutomaticUpdates(5);
   void recoverAutomaticUpdateHandoff();
+  void checkForUpdateIfStale({ allowFirst: true });
   schedulePump(1000);
 });
 
@@ -6597,6 +6621,7 @@ chrome.runtime.onStartup.addListener(() => {
   chrome.alarms.create(DIAGNOSTIC_FLUSH_ALARM, { periodInMinutes: 1 });
   scheduleAutomaticUpdates(2);
   void recoverAutomaticUpdateHandoff();
+  void checkForUpdateIfStale({ allowFirst: true });
   schedulePump(1000);
 });
 
@@ -6693,6 +6718,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       case "GET_UPDATE_STATUS": {
         void recoverAutomaticUpdateHandoff();
+        void checkForUpdateIfStale();
         const data = await chrome.storage.local.get("popoUpdateStatus");
         const updateStatus = data.popoUpdateStatus || {
           state: "idle",
