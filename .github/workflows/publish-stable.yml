@@ -51,8 +51,6 @@ jobs:
 
       - name: Set up Gopeed build toolchain
         uses: ./automation/.github/actions/setup-gopeed-toolchain
-        with:
-          source-root: release-source
 
       - name: Validate tag and version metadata
         shell: pwsh

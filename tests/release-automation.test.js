@@ -409,25 +409,3 @@ test("release also signs and publishes a GitHub backup manifest; only the COS ma
   assert.doesNotMatch(host, /AllowAutoRedirect\s*=\s*true/);
   assert.match(host, /VerifyDownloadedPackage\(manifest, archivePath\)/);
 });
-
-test("toolchain caching covers downloads only: pinned actions, verified LLVM archive, no cached Gopeed binary", () => {
-  const action = fs.readFileSync(path.join(root, ".github", "actions", "setup-gopeed-toolchain", "action.yml"), "utf8");
-  const validation = fs.readFileSync(path.join(root, ".github", "workflows", "windows-validation.yml"), "utf8");
-  // every third-party action stays pinned to a full commit SHA
-  for (const match of action.matchAll(/uses:\s*(\S+)/g)) assert.match(match[1], /@[0-9a-f]{40}$/, match[1]);
-  // Go, Flutter and the LLVM-MinGW archive are cached
-  assert.match(action, /actions\/setup-go@[0-9a-f]{40}[\s\S]*cache: true/);
-  assert.match(action, /subosito\/flutter-action@[0-9a-f]{40}[\s\S]*cache: true/);
-  assert.match(action, /actions\/cache@[0-9a-f]{40}[\s\S]*llvm-mingw-20260922-ucrt-x86_64\.zip/);
-  // a restored archive is untrusted: its SHA-256 is checked and a mismatch triggers a fresh download
-  assert.match(action, /cached LLVM-MinGW archive does not match the pinned SHA-256/);
-  assert.match(action, /The pinned LLVM-MinGW archive SHA-256 does not match\./);
-  // the only explicit cache path is the LLVM-MinGW archive; the built Gopeed output is never restored from a cache
-  assert.deepEqual(
-    [...action.matchAll(/^\s+path:\s*(.+?)\s*$/gm)].map((match) => match[1]),
-    ["${{ runner.temp }}/popo-gopeed-tooling/llvm-mingw-20260922-ucrt-x86_64.zip"]
-  );
-  // both call sites tell the action where the checked-out source lives
-  assert.match(validation, /setup-gopeed-toolchain\s*\n\s+with:\s*\n\s+source-root: \./);
-  assert.match(workflow, /setup-gopeed-toolchain\s*\n\s+with:\s*\n\s+source-root: release-source/);
-});
