@@ -16,15 +16,23 @@
 
 - 下载恢复 T5 缺现场证据（见 [download-recovery-tasks.md](tasks/download-recovery-tasks.md)）。需要的证据：真实 POPO 页面的失败素材已恢复，Windows 实际落盘完整，Sentry 原事件已核对。0.8.0 已带上对应代码和自动测试，只缺现场验收。
 
-### 交接前必须转移的权限
+### 停止维护后的外部服务
 
-接手人需要以下权限才能继续发布。权限仍在原维护人账号下时，先完成转移再开始发布：
+腾讯云 COS 与 Sentry 属于原维护人个人账号。停止维护后两者断开，不交接。
 
-- GitHub 仓库管理权限、Actions secrets 与 Actions variables（完整清单见 [RELEASING.md](RELEASING.md)「首次启用」）。
-- 签名私钥 `POPO_RELEASE_SIGNING_KEY_BASE64` 的原件。GitHub secret 写入后不能读出，所以必须另行交付原件。已安装的客户端内置对应公钥（`native-host/FolderPickerHost.cs`）。原件丢失后，现有客户端不再接受任何新版本。
-- 腾讯云 COS 桶 `popo-updates-1461466196` 及其 CAM 身份。
-- Sentry 项目访问权限。
-- Windows 验证机（SSH 别名 `edy-main`）及其上的 Dev/Stable 测试目录。
+- 腾讯云断开后，0.8.1 及以后的客户端只能从 GitHub 备用源更新。0.8.0 及更早的客户端不再收到更新。
+- Sentry 断开后，客户端的诊断回传不再有人接收。
+- GitHub 仓库 `mxwayne/popo-downloader` 是唯一剩下的更新源。客户端写死了这个路径，每一跳重定向都必须在 `/mxwayne/popo-downloader/` 下（见 [update-github-source.md](specs/update-github-source.md)）。删除、改名或转移仓库都会切断所有客户端的更新。
+
+### 恢复发布的前提
+
+接手人要发布新版，必须先满足以下条件：
+
+- 拥有 GitHub 仓库的管理权限，Actions secrets 与 variables 的清单见 [RELEASING.md](RELEASING.md)「首次启用」。
+- 拿到签名私钥 `POPO_RELEASE_SIGNING_KEY_BASE64` 的原件。GitHub secret 写入后不能读出，必须另行交付原件。已安装的客户端内置对应公钥（`native-host/FolderPickerHost.cs`）。原件丢失后，现有客户端不再接受任何新版本。
+- 修改发布流程：去掉腾讯云上传和 `stable/latest.json` 切换（`.github/workflows/publish-stable.yml`），或者换成新的 COS 桶。新桶只对新版客户端有效。
+- 修改 Stable 构建：去掉 `POPO_DIAGNOSTIC_DSN` 的必填检查（`scripts/build-test-package.ps1`、`scripts/build-runtime.mjs`），或者配置新的 Sentry DSN。
+- 拥有一台 Windows 验证机。原验证机的 SSH 别名是 `edy-main`。
 
 ## 接手基线
 
