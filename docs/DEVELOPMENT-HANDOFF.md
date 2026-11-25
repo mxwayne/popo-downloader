@@ -1,11 +1,36 @@
-# POPO macOS 开发接手说明
+# POPO 开发接手说明
+
+## 项目收尾状态（2026-11-25）
+
+原维护人于 2026-11-25 停止维护本项目。本节记录停止时的状态，供后续接手人使用。
+
+- 最后正式版：`v0.8.4`（2026-11-18），源码提交 `ffd9655`。
+- `Publish stable release` 工作流对 `v0.8.4` 运行成功。GitHub Release 与腾讯云 `stable/latest.json` 均指向 0.8.4。
+- 收尾时 `main` 与 `origin/main` 一致。没有未提交改动、其他分支、stash、未合并 PR 或未关闭 issue。
+- 2026-11-25 在 macOS 上运行 `npm run check:full`，结果通过：
+  - Node 测试 344 项：300 项通过，44 项按平台条件跳过，0 项失败。
+  - Playwright 测试 17 项：16 项通过，1 项跳过，0 项失败。
+- 变更历史见 [CHANGELOG.md](../CHANGELOG.md)。正式发布流程见 [RELEASING.md](RELEASING.md)。
+
+### 未完成事项
+
+- 下载恢复 T5 缺现场证据（见 [download-recovery-tasks.md](tasks/download-recovery-tasks.md)）。需要的证据：真实 POPO 页面的失败素材已恢复，Windows 实际落盘完整，Sentry 原事件已核对。0.8.0 已带上对应代码和自动测试，只缺现场验收。
+
+### 交接前必须转移的权限
+
+接手人需要以下权限才能继续发布。权限仍在原维护人账号下时，先完成转移再开始发布：
+
+- GitHub 仓库管理权限、Actions secrets 与 Actions variables（完整清单见 [RELEASING.md](RELEASING.md)「首次启用」）。
+- 签名私钥 `POPO_RELEASE_SIGNING_KEY_BASE64` 的原件。GitHub secret 写入后不能读出，所以必须另行交付原件。已安装的客户端内置对应公钥（`native-host/FolderPickerHost.cs`）。原件丢失后，现有客户端不再接受任何新版本。
+- 腾讯云 COS 桶 `popo-updates-1461466196` 及其 CAM 身份。
+- Sentry 项目访问权限。
+- Windows 验证机（SSH 别名 `edy-main`）及其上的 Dev/Stable 测试目录。
 
 ## 接手基线
 
 - 工作分支：`main`。
-- 写入本文档前的源码基线：`4e3c229bd60dd46b82e760586f8c3d1abfe4d552`。
-- 最终接手提交是包含本文档的 `main` 提交；Mac 拉取后以 `git rev-parse HEAD` 为准，并与 Windows 迁移报告中的 `SOURCE_COMMIT` 完全一致。
-- Windows 收口时没有待提交的生产源码、测试或脚本改动；本次新增内容仅为这份迁移接手说明。当前基线已经包含下载文件扩展名保留修复，以及安装候选路径长度约束修复。
+- 当前基线以 `git rev-parse HEAD` 为准。最后正式版的源码基线见上文「项目收尾状态」。
+- 历史记录：2026-08-28 开发从 Windows 迁到 macOS，当时的源码基线是 `4e3c229bd60dd46b82e760586f8c3d1abfe4d552`。
 
 ## 依赖与环境
 
